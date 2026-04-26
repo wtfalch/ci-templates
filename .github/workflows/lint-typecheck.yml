@@ -7,10 +7,6 @@ on:
         type: string
         required: false
         default: '22'
-      pnpm-version:
-        type: string
-        required: false
-        default: '10'
 
 jobs:
   check:
@@ -18,9 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # pnpm version comes from packageManager in package.json — don't double-specify here.
       - uses: pnpm/action-setup@v4
-        with:
-          version: ${{ inputs.pnpm-version }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
