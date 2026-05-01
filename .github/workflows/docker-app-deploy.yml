@@ -21,6 +21,18 @@ on:
         type: string
         required: false
         default: ''
+      build-args:
+        description: |
+          Multi-line list of `KEY=VALUE` pairs forwarded as `--build-arg` to
+          `docker/build-push-action`. Use for vars that must be present at
+          `next build` time (e.g. NEXT_PUBLIC_*, which Next bakes into the
+          client bundle). Caller resolves values from secrets:
+            build-args: |
+              NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+              NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        type: string
+        required: false
+        default: ''
     secrets:
       DEPLOY_SSH_KEY:
         required: true
@@ -62,6 +74,7 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:latest
             ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ github.sha }}
+          build-args: ${{ inputs.build-args }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
