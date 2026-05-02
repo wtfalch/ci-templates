@@ -33,19 +33,27 @@ on:
         type: string
         required: false
         default: ''
+      build-only:
+        description: |
+          When true, build and push the image but skip deploy + Cloudflare purge.
+          Useful for PR previews that want to verify the image builds without
+          shipping to the host.
+        type: boolean
+        required: false
+        default: false
     secrets:
       DEPLOY_SSH_KEY:
-        required: true
+        required: false
       CF_ACCESS_CLIENT_ID:
-        required: true
+        required: false
       CF_ACCESS_CLIENT_SECRET:
-        required: true
+        required: false
       DEPLOY_HOST:
-        required: true
+        required: false
       DEPLOY_USER:
-        required: true
+        required: false
       DEPLOY_PATH:
-        required: true
+        required: false
       CLOUDFLARE_API_TOKEN:
         description: API token with Zone Cache Purge scope. Required only if cloudflare-zone-id is set.
         required: false
@@ -53,6 +61,12 @@ on:
 permissions:
   contents: read
   packages: write
+
+# Queue deploys for a given ref; never cancel mid-flight (would leave the host
+# in a half-pulled state). Multiple branches can deploy in parallel.
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -75,11 +89,23 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:latest
             ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ github.sha }}
           build-args: ${{ inputs.build-args }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Two-tier cache: GHA cache is fast for same-runner reuse, registry
+          # cache survives across forks/Renovate PRs and is hit even when GHA
+          # cache eviction kicks in (10 GB cap per repo).
+          cache-from: |
+            type=gha
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:buildcache
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:buildcache,mode=max
+          # Provenance + SBOM attestations add 5–15 s and aren't consumed by
+          # private-VPS deploys. Keep off; opt back in if SLSA is ever needed.
+          provenance: false
+          sbom: false
 
   deploy:
     needs: build
+    if: ${{ !inputs.build-only }}
     runs-on: ubuntu-latest
     steps:
       - name: Install cloudflared
