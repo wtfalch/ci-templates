@@ -202,6 +202,7 @@ jobs:
              tar -C '${PREVIEW_DIR}' -xf -; \
              chmod 600 '${PREVIEW_DIR}/.env'; \
              cd '${PREVIEW_DIR}'; \
+             docker compose -p 'pr-${PR_NUMBER}' down -v --remove-orphans 2>/dev/null || true; \
              docker compose -p 'pr-${PR_NUMBER}' pull --quiet; \
              docker compose -p 'pr-${PR_NUMBER}' up -d --wait --wait-timeout 240; \
              docker image prune -f"
