@@ -1,0 +1,103 @@
+name: PR preview cleanup
+
+# Reusable workflow that tears down a per-PR preview deployment: stops the
+# `pr-{N}` compose project on the LXC, removes the rendered files, and
+# deletes the GHCR image tags pushed by pr-preview.yml. Idempotent — a
+# missing compose project or already-deleted tag is not an error.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        type: string
+        required: true
+      pr-number:
+        description: PR number whose preview should be torn down. Defaults to the triggering PR.
+        type: string
+        required: false
+        default: ${{ github.event.pull_request.number }}
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      CF_ACCESS_CLIENT_ID:
+        required: true
+      CF_ACCESS_CLIENT_SECRET:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+# Per-PR cleanup serializes against any in-flight build for the same PR
+# so we don't bring it down while it's still being deployed.
+concurrency:
+  group: pr-preview-${{ inputs.app-name }}-${{ inputs.pr-number }}
+  cancel-in-progress: false
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.pr-number != '' }}
+    steps:
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Bring down compose + remove preview dir
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          APP_NAME: ${{ inputs.app-name }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          set -euo pipefail
+          PREVIEW_DIR="/opt/previews/${APP_NAME}/pr-${PR_NUMBER}"
+          ssh -i ~/.ssh/id_ed25519 \
+            -o StrictHostKeyChecking=no \
+            -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
+            "${SSH_USER}@${HOST}" \
+            "set -uo pipefail; \
+             if [ -d '${PREVIEW_DIR}' ]; then \
+               cd '${PREVIEW_DIR}' && docker compose -p 'pr-${PR_NUMBER}' down -v --remove-orphans || true; \
+               rm -rf '${PREVIEW_DIR}'; \
+             else \
+               echo 'no preview dir for pr-${PR_NUMBER}, nothing to tear down'; \
+             fi; \
+             docker image prune -f"
+
+      - name: Delete GHCR image tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          APP_NAME: ${{ inputs.app-name }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          set -uo pipefail
+          # GHCR org-vs-user package APIs differ; try org first, fall back to user.
+          # Iterate all versions; delete those whose tags include pr-{N} or pr-{N}-migrate.
+          for endpoint in "orgs/${OWNER}/packages/container/${APP_NAME}/versions" "users/${OWNER}/packages/container/${APP_NAME}/versions"; do
+            response=$(gh api "${endpoint}?per_page=100" 2>/dev/null) || continue
+            echo "$response" | jq -c '.[]' | while read -r v; do
+              id=$(echo "$v" | jq -r '.id')
+              tags=$(echo "$v" | jq -r '.metadata.container.tags[]?' 2>/dev/null || true)
+              if echo "$tags" | grep -qE "^pr-${PR_NUMBER}(-migrate)?$"; then
+                echo "deleting GHCR version ${id} (tags: $(echo "$tags" | tr '\n' ',' | sed 's/,$//'))"
+                gh api -X DELETE "${endpoint}/${id}" || echo "  (delete failed, continuing)"
+              fi
+            done
+            break
+          done
