@@ -166,6 +166,13 @@ jobs:
           envsubst "$VARS" < preview/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < preview/.env.template        > rendered/.env
           envsubst "$VARS" < preview/kong.template.yml    > rendered/kong.yml
+          # init-roles.sh is mounted into the db container's
+          # /docker-entrypoint-initdb.d/. It reads $POSTGRES_PASSWORD at runtime,
+          # so no envsubst — ship it verbatim. Must be executable.
+          if [ -f preview/init-roles.sh ]; then
+            cp preview/init-roles.sh rendered/init-roles.sh
+            chmod +x rendered/init-roles.sh
+          fi
 
       - name: Install cloudflared
         run: |
@@ -192,7 +199,12 @@ jobs:
           # Single SSH session: tar the rendered files via stdin, run docker compose.
           # cloudflared access ssh adds ~2 s of handshake — folding into one call
           # avoids paying that 3×.
-          tar -C rendered -cf - compose.yml .env kong.yml | \
+          # init-roles.sh is optional (only present for apps that need to
+          # sync supabase role passwords — i.e. anything using a Supabase
+          # stack in preview). tar-from-list lets us include it conditionally.
+          FILES="compose.yml .env kong.yml"
+          [ -f rendered/init-roles.sh ] && FILES="$FILES init-roles.sh"
+          tar -C rendered -cf - $FILES | \
           ssh -i ~/.ssh/id_ed25519 \
             -o StrictHostKeyChecking=no \
             -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
