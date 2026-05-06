@@ -186,6 +186,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
 
       - name: Ship templates + bring up compose
+        id: bring-up
         env:
           CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
@@ -218,6 +219,29 @@ jobs:
              docker compose -p 'pr-${PR_NUMBER}' pull --quiet; \
              docker compose -p 'pr-${PR_NUMBER}' up -d --wait --wait-timeout 240; \
              docker image prune -f"
+
+      - name: Capture container logs on failure
+        if: failure() && steps.bring-up.outcome == 'failure'
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Grab logs from the per-PR migrate + db containers so we can
+          # diagnose without SSHing manually. Best-effort — never fails the
+          # workflow further than it already has.
+          ssh -i ~/.ssh/id_ed25519 \
+            -o StrictHostKeyChecking=no \
+            -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
+            "${SSH_USER}@${HOST}" \
+            "echo '=== migrate logs ==='; \
+             docker compose -p 'pr-${PR_NUMBER}' logs migrate 2>&1 || true; \
+             echo; echo '=== db logs (last 100) ==='; \
+             docker compose -p 'pr-${PR_NUMBER}' logs db --tail 100 2>&1 || true; \
+             echo; echo '=== compose ps ==='; \
+             docker compose -p 'pr-${PR_NUMBER}' ps -a 2>&1 || true" || true
 
       - name: Comment preview URL on PR
         uses: actions/github-script@v7
