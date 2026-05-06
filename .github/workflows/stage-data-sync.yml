@@ -1,0 +1,139 @@
+name: Stage data sync
+
+# Reusable workflow that snapshots prod's data + schema into stage.
+# Triggered by the caller via workflow_dispatch (and optionally cron).
+#
+# Strategy: pg_dump prod (schema + data) → restore stage. Drops + recreates
+# everything in the public + auth schemas. Stage's existing test-state is
+# wiped on every run, so don't run this while QA is mid-flow.
+#
+# Why pg_dump 17: Supabase Cloud is on PostgreSQL 17. pg_dump < server
+# version refuses to run with "aborting because of server version mismatch".
+# Stock GitHub runners ship pg 14; we install pg 17 from the pgdg apt repo.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        type: string
+        required: true
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      CF_ACCESS_CLIENT_ID:
+        required: true
+      CF_ACCESS_CLIENT_SECRET:
+        required: true
+      PROD_DATABASE_URL:
+        description: Direct (non-pooler) Postgres connection string for prod.
+        required: true
+      PREVIEW_POSTGRES_PASSWORD:
+        required: true
+
+permissions:
+  contents: read
+
+# One sync at a time per app — never two pg_dumps fighting over stage.
+concurrency:
+  group: stage-data-sync-${{ inputs.app-name }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install psql 17 + cloudflared
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: pg_dump prod → restore stage
+        env:
+          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+          PREVIEW_POSTGRES_PASSWORD: ${{ secrets.PREVIEW_POSTGRES_PASSWORD }}
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          APP_NAME: ${{ inputs.app-name }}
+        run: |
+          set -euo pipefail
+          # auth.users token columns: gotrue 2.158.1 (stage) scans them as
+          # non-nullable Go strings; prod has nulls. Patch after restore.
+          # SQL is appended to the dump stream before the closing COMMIT.
+          # session_replication_role = 'replica' disables triggers + FK
+          # checks during the apply. handle_new_user trigger would otherwise
+          # try to re-create profile rows on every auth.users insert.
+          {
+            echo "BEGIN;"
+            echo "SET session_replication_role = 'replica';"
+            # Drop both schemas + recreate. Restoring the dump puts them
+            # back. Done before the transaction body so search_path lookups
+            # in the dump resolve to the new schemas.
+            echo "DROP SCHEMA IF EXISTS public CASCADE;"
+            echo "DROP SCHEMA IF EXISTS auth CASCADE;"
+            echo "CREATE SCHEMA public;"
+            echo "CREATE SCHEMA auth;"
+            pg_dump "$PROD_DATABASE_URL" \
+              --no-owner \
+              --no-privileges \
+              --no-comments \
+              --schema=public \
+              --schema=auth
+            echo "UPDATE auth.users SET"
+            echo "  confirmation_token = COALESCE(confirmation_token, ''),"
+            echo "  recovery_token = COALESCE(recovery_token, ''),"
+            echo "  email_change_token_new = COALESCE(email_change_token_new, ''),"
+            echo "  email_change = COALESCE(email_change, ''),"
+            echo "  email_change_token_current = COALESCE(email_change_token_current, ''),"
+            echo "  phone_change = COALESCE(phone_change, ''),"
+            echo "  phone_change_token = COALESCE(phone_change_token, ''),"
+            echo "  reauthentication_token = COALESCE(reauthentication_token, '');"
+            echo "SET session_replication_role = 'origin';"
+            echo "COMMIT;"
+          } | ssh -i ~/.ssh/id_ed25519 \
+              -o StrictHostKeyChecking=no \
+              -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
+              "${SSH_USER}@${HOST}" \
+              "docker exec -i -e PGPASSWORD='${PREVIEW_POSTGRES_PASSWORD}' \
+                'stage-${APP_NAME}-db' \
+                psql -U supabase_admin -h 127.0.0.1 -d postgres \
+                -v ON_ERROR_STOP=1 -q"
+
+          echo "::notice::synced prod into stage-${APP_NAME}"
+
+      - name: Restart stage-auth + stage-rest (schema changed)
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          APP_NAME: ${{ inputs.app-name }}
+        run: |
+          # PostgREST caches the schema cache at startup. After we replaced
+          # public.* it has stale metadata. Restart it. Same for gotrue,
+          # since auth.* was dropped+recreated.
+          ssh -i ~/.ssh/id_ed25519 \
+            -o StrictHostKeyChecking=no \
+            -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
+            "${SSH_USER}@${HOST}" \
+            "docker restart 'stage-${APP_NAME}-rest' 'stage-${APP_NAME}-auth' || true"

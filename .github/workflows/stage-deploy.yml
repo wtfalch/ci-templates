@@ -1,0 +1,201 @@
+name: Stage deploy
+
+# Reusable workflow that builds + deploys the persistent staging environment
+# for an app. Triggered by the caller on push to main (and via
+# workflow_dispatch). Brings up `stage-{app}` compose project on the LXC,
+# rendering /opt/stage/{app}/{compose.yml,.env,kong.yml,init-roles.sh} from
+# the templates in `stage/` of the app's repo.
+#
+# Stage is a SANDBOX: data persists across deploys (named volume), refreshed
+# from prod only via stage-data-sync.yml (manual / cron). Per-PR previews
+# share stage's supabase stack so PRs see prod-like data while their own
+# `web` is the only per-PR moving piece.
+#
+# Migrations: drizzle/*.sql is applied to stage's DB BEFORE the new web
+# container starts, so a main-branch merge that includes a schema change
+# brings stage forward atomically with the code.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        type: string
+        required: true
+      app-domain:
+        type: string
+        required: true
+      node-version:
+        type: string
+        required: false
+        default: '22'
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      CF_ACCESS_CLIENT_ID:
+        required: true
+      CF_ACCESS_CLIENT_SECRET:
+        required: true
+      PREVIEW_POSTGRES_PASSWORD:
+        required: true
+      PREVIEW_JWT_SECRET:
+        required: true
+      PREVIEW_ANON_KEY:
+        required: true
+      PREVIEW_SERVICE_ROLE_KEY:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+# One stage deploy at a time per app — never two main-branch merges
+# applying conflicting migrations to the same DB.
+concurrency:
+  group: stage-deploy-${{ inputs.app-name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: stage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          target: runner
+          tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.app-name }}:stage
+          build-args: |
+            NEXT_PUBLIC_SUPABASE_URL=https://stage.${{ inputs.app-domain }}/supabase
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.PREVIEW_ANON_KEY }}
+          cache-from: |
+            type=gha
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.app-name }}:buildcache
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Build & push migrate image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          target: migrate
+          tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.app-name }}:stage-migrate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render compose + .env + kong.yml from templates
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+          APP_DOMAIN: ${{ inputs.app-domain }}
+          GHCR_OWNER: ${{ github.repository_owner }}
+          POSTGRES_PASSWORD: ${{ secrets.PREVIEW_POSTGRES_PASSWORD }}
+          JWT_SECRET: ${{ secrets.PREVIEW_JWT_SECRET }}
+          ANON_KEY: ${{ secrets.PREVIEW_ANON_KEY }}
+          SERVICE_ROLE_KEY: ${{ secrets.PREVIEW_SERVICE_ROLE_KEY }}
+        run: |
+          set -euo pipefail
+          for f in stage/compose.template.yml stage/.env.template stage/kong.template.yml; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f missing in repo. Copy from app-template's stage/."
+              exit 1
+            fi
+          done
+          mkdir -p rendered
+          VARS='$APP_NAME $APP_DOMAIN $GHCR_OWNER $POSTGRES_PASSWORD $JWT_SECRET $ANON_KEY $SERVICE_ROLE_KEY'
+          envsubst "$VARS" < stage/compose.template.yml > rendered/compose.yml
+          envsubst "$VARS" < stage/.env.template        > rendered/.env
+          envsubst "$VARS" < stage/kong.template.yml    > rendered/kong.yml
+          if [ -f stage/init-roles.sh ]; then
+            cp stage/init-roles.sh rendered/init-roles.sh
+            chmod +x rendered/init-roles.sh
+          fi
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Ship templates + bring stage up
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          APP_NAME: ${{ inputs.app-name }}
+        run: |
+          set -euo pipefail
+          STAGE_DIR="/opt/stage/${APP_NAME}"
+          # NO `down -v` here — we want stage's DB to persist across deploys.
+          # `up -d --wait` is enough: compose detects services that need to be
+          # recreated (image changed → web), leaves db/auth/rest alone if
+          # their config didn't change.
+          FILES="compose.yml .env kong.yml"
+          [ -f rendered/init-roles.sh ] && FILES="$FILES init-roles.sh"
+          tar -C rendered -cf - $FILES | \
+          ssh -i ~/.ssh/id_ed25519 \
+            -o StrictHostKeyChecking=no \
+            -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
+            "${SSH_USER}@${HOST}" \
+            "set -euo pipefail; \
+             mkdir -p '${STAGE_DIR}'; \
+             tar -C '${STAGE_DIR}' -xf -; \
+             chmod 600 '${STAGE_DIR}/.env'; \
+             cd '${STAGE_DIR}'; \
+             docker compose -p 'stage-${APP_NAME}' pull --quiet; \
+             docker compose -p 'stage-${APP_NAME}' up -d --wait --wait-timeout 240; \
+             docker image prune -f"
+
+      - name: Apply migrations against stage DB
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          APP_NAME: ${{ inputs.app-name }}
+          GHCR_OWNER: ${{ github.repository_owner }}
+        run: |
+          # Run the :stage-migrate image against stage's db. The migrate
+          # container's DATABASE_URL inside the stage stack already points at
+          # the local postgres via `db:5432` (env_file ./.env on the migrate
+          # service when it's defined inline). Here we run as a one-off
+          # against the same network so it reaches `db`.
+          ssh -i ~/.ssh/id_ed25519 \
+            -o StrictHostKeyChecking=no \
+            -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
+            "${SSH_USER}@${HOST}" \
+            "cd /opt/stage/${APP_NAME} && \
+             docker run --rm \
+               --network stage-${APP_NAME}_default \
+               --env-file .env \
+               'ghcr.io/${GHCR_OWNER}/${APP_NAME}:stage-migrate'"
