@@ -92,13 +92,15 @@ jobs:
           {
             echo "BEGIN;"
             echo "SET session_replication_role = 'replica';"
-            # Drop both schemas + recreate. Restoring the dump puts them
-            # back. Done before the transaction body so search_path lookups
-            # in the dump resolve to the new schemas.
+            # Drop both schemas; pg_dump's output recreates them. We used
+            # to also pre-`CREATE SCHEMA public; CREATE SCHEMA auth;` here
+            # so search_path resolution in the dump body would land on the
+            # new schemas — but the dump body itself contains
+            # `CREATE SCHEMA public;` / `CREATE SCHEMA auth;` and a
+            # pre-create + dump's create races into "schema already exists"
+            # under ON_ERROR_STOP. Let the dump own schema creation.
             echo "DROP SCHEMA IF EXISTS public CASCADE;"
             echo "DROP SCHEMA IF EXISTS auth CASCADE;"
-            echo "CREATE SCHEMA public;"
-            echo "CREATE SCHEMA auth;"
             # pg_dump 17 emits constructs that pre-17 servers (e.g. stage's
             # supabase/postgres:15.1.1.78) reject and abort restore on:
             #   - `\restrict <tag>` / `\unrestrict <tag>` psql metacommands
