@@ -208,11 +208,19 @@ jobs:
           # the local postgres via `db:5432` (env_file ./.env on the migrate
           # service when it's defined inline). Here we run as a one-off
           # against the same network so it reaches `db`.
+          #
+          # `docker pull` first — `docker run` would otherwise reuse the
+          # locally-cached image even when GHCR has a newer manifest under
+          # the same `:stage-migrate` tag. Without this, an app that
+          # changes its migrate target (e.g. drizzle-kit → psql) keeps
+          # running the previous build until someone manually clears the
+          # cached image on the host.
           ssh -i ~/.ssh/id_ed25519 \
             -o StrictHostKeyChecking=no \
             -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
             "${SSH_USER}@${HOST}" \
             "cd /opt/stage/${APP_NAME} && \
+             docker pull 'ghcr.io/${GHCR_OWNER}/${APP_NAME}:stage-migrate' && \
              docker run --rm \
                --network stage-${APP_NAME}_default \
                --env-file .env \
