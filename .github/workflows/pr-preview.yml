@@ -66,6 +66,14 @@ on:
           environment:production while preview events stay visible for
           debugging. Optional — empty string skips Sentry init entirely.
         required: false
+      RESEND_API_TOKEN:
+        description: |
+          Resend API token. Available at runtime to per-PR web containers
+          for app-level Resend SDK calls. (Per-PR previews share stage's
+          gotrue, so SMTP-via-Resend for auth is configured stage-side.)
+          Optional — empty string falls back to runtime errors when send
+          is attempted.
+        required: false
 
 permissions:
   contents: read
@@ -158,6 +166,7 @@ jobs:
           # `pr-shared` for Drizzle / postgres-js queries that bypass kong).
           POSTGRES_PASSWORD: ${{ secrets.PREVIEW_POSTGRES_PASSWORD }}
           NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+          RESEND_API_TOKEN: ${{ secrets.RESEND_API_TOKEN }}
         run: |
           set -euo pipefail
           for f in preview/compose.template.yml preview/.env.template; do
@@ -170,7 +179,7 @@ jobs:
           # Per-PR previews share stage's supabase stack. POSTGRES_PASSWORD is
           # threaded so DATABASE_URL in preview/.env can hit stage's db
           # directly. JWT_SECRET stays per-stage-only.
-          VARS='$PR_NUMBER $APP_NAME $APP_DOMAIN $GHCR_OWNER $ANON_KEY $SERVICE_ROLE_KEY $POSTGRES_PASSWORD $NEXT_PUBLIC_SENTRY_DSN'
+          VARS='$PR_NUMBER $APP_NAME $APP_DOMAIN $GHCR_OWNER $ANON_KEY $SERVICE_ROLE_KEY $POSTGRES_PASSWORD $NEXT_PUBLIC_SENTRY_DSN $RESEND_API_TOKEN'
           envsubst "$VARS" < preview/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < preview/.env.template        > rendered/.env
 

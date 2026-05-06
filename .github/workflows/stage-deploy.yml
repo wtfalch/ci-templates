@@ -54,6 +54,13 @@ on:
           environment:production while stage events stay visible for
           debugging. Optional — empty string skips Sentry init entirely.
         required: false
+      RESEND_API_TOKEN:
+        description: |
+          Resend API token. Used at runtime by stage's gotrue for SMTP send
+          (auth flows: signup, magic link, password reset) and by any app-
+          level Resend SDK calls. Optional — empty string falls back to
+          gotrue's default (errors on send rather than silently dropping).
+        required: false
 
 permissions:
   contents: read
@@ -127,6 +134,7 @@ jobs:
           ANON_KEY: ${{ secrets.PREVIEW_ANON_KEY }}
           SERVICE_ROLE_KEY: ${{ secrets.PREVIEW_SERVICE_ROLE_KEY }}
           NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+          RESEND_API_TOKEN: ${{ secrets.RESEND_API_TOKEN }}
         run: |
           set -euo pipefail
           for f in stage/compose.template.yml stage/.env.template stage/kong.template.yml; do
@@ -136,7 +144,7 @@ jobs:
             fi
           done
           mkdir -p rendered
-          VARS='$APP_NAME $APP_DOMAIN $GHCR_OWNER $POSTGRES_PASSWORD $JWT_SECRET $ANON_KEY $SERVICE_ROLE_KEY $NEXT_PUBLIC_SENTRY_DSN'
+          VARS='$APP_NAME $APP_DOMAIN $GHCR_OWNER $POSTGRES_PASSWORD $JWT_SECRET $ANON_KEY $SERVICE_ROLE_KEY $NEXT_PUBLIC_SENTRY_DSN $RESEND_API_TOKEN'
           envsubst "$VARS" < stage/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < stage/.env.template        > rendered/.env
           envsubst "$VARS" < stage/kong.template.yml    > rendered/kong.yml
