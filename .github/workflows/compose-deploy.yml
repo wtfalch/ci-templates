@@ -111,23 +111,26 @@ jobs:
               -o StrictHostKeyChecking=no \
               -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
               "${SSH_USER}@${HOST}" \
-              "set -euxo pipefail
+              "set -euo pipefail
                cd '${STACK_DIR}'
                rm -rf .compose-deploy-tmp
                mkdir -p .compose-deploy-tmp
-               tar -xvf - -C .compose-deploy-tmp 2>&1 || echo TAR_FAILED_EXIT=\$?
-               echo POST_TAR_LISTING:
-               ls -la .compose-deploy-tmp/
+               tar -xf - -C .compose-deploy-tmp
                # --project-directory . tells compose to resolve --env-file
                # relative to cwd (where the live .env lives) rather than
-               # relative to the compose file's parent dir (the tmpdir, where
-               # it doesn't). Without it, compose looks for
-               # .compose-deploy-tmp/.env and errors.
-               echo BEGIN_VALIDATE
-               docker compose -f .compose-deploy-tmp/docker-compose.yml --project-directory . --env-file .env config -q 2>&1 || (echo VALIDATE_EXIT=\$? && exit 1)
-               echo END_VALIDATE
-               # Backup + atomic swap. .bak is the rollback handle:
+               # the compose file's parent dir (the tmpdir, where it doesn't).
+               if ! docker compose -f .compose-deploy-tmp/docker-compose.yml --project-directory . --env-file .env config -q; then
+                 echo '::error::compose validation failed; live compose left in place'
+                 rm -rf .compose-deploy-tmp
+                 exit 1
+               fi
+               # Backup + atomic swap. rm -f the prior .bak first because the
+               # deploy user may not own it (manual edits in incidents are
+               # often done as root, leaving root-owned .bak files behind);
+               # rm only needs write on the parent dir, which deploy has.
+               # The .bak file is the one-line rollback handle:
                #   ssh root@lxc 'cd /opt/stack/{app}; cp docker-compose.yml.bak docker-compose.yml && docker compose up -d --remove-orphans'
+               rm -f docker-compose.yml.bak
                cp docker-compose.yml docker-compose.yml.bak
                mv .compose-deploy-tmp/docker-compose.yml docker-compose.yml
                rmdir .compose-deploy-tmp
