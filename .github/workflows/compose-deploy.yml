@@ -116,7 +116,12 @@ jobs:
                rm -rf .compose-deploy-tmp
                mkdir -p .compose-deploy-tmp
                tar -xf - -C .compose-deploy-tmp
-               if ! docker compose -f .compose-deploy-tmp/docker-compose.yml --env-file .env config -q; then
+               # --project-directory . tells compose to resolve --env-file
+               # relative to cwd (where the live .env lives) rather than
+               # relative to the compose file's parent dir (the tmpdir, where
+               # it doesn't). Without it, compose looks for
+               # .compose-deploy-tmp/.env and errors.
+               if ! docker compose -f .compose-deploy-tmp/docker-compose.yml --project-directory . --env-file .env config -q; then
                  echo '::error::compose validation failed; live compose left in place'
                  rm -rf .compose-deploy-tmp
                  exit 1
