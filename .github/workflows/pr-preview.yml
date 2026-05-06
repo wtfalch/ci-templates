@@ -96,10 +96,12 @@ jobs:
         id: tag
         run: echo "tag=pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
 
-      # NEXT_PUBLIC_SUPABASE_URL points at the per-PR Kong gateway (a separate
-      # wildcard subdomain so the supabase-js client can reach it from the
-      # browser). The anon key is constant across previews (signed once at
-      # bootstrap with PREVIEW_JWT_SECRET).
+      # NEXT_PUBLIC_SUPABASE_URL points at /supabase under the SAME hostname
+      # as the app — Caddy strips that prefix and proxies to kong. Single
+      # origin keeps requests same-origin (Cloudflare Access cookie is host-
+      # only, so a separate -api subdomain would drop the cookie on cross-
+      # origin fetch, breaking auth). The anon key is constant across
+      # previews (signed once at bootstrap with PREVIEW_JWT_SECRET).
       - name: Build & push web image
         uses: docker/build-push-action@v6
         with:
@@ -108,7 +110,7 @@ jobs:
           target: runner
           tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.app-name }}:${{ steps.tag.outputs.tag }}
           build-args: |
-            NEXT_PUBLIC_SUPABASE_URL=https://pr-${{ github.event.pull_request.number }}-preview-api.${{ inputs.app-domain }}
+            NEXT_PUBLIC_SUPABASE_URL=https://pr-${{ github.event.pull_request.number }}-preview.${{ inputs.app-domain }}/supabase
             NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.PREVIEW_ANON_KEY }}
           cache-from: |
             type=gha
