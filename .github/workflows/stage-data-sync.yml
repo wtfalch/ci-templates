@@ -28,7 +28,7 @@ on:
         required: true
       CF_ACCESS_CLIENT_SECRET:
         required: true
-      PROD_DATABASE_URL:
+      DATABASE_URL:
         description: Direct (non-pooler) Postgres connection string for prod.
         required: true
       PREVIEW_POSTGRES_PASSWORD:
@@ -68,7 +68,7 @@ jobs:
 
       - name: pg_dump prod → restore stage
         env:
-          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+          PROD_DATABASE_URL: ${{ secrets.DATABASE_URL }}
           PREVIEW_POSTGRES_PASSWORD: ${{ secrets.PREVIEW_POSTGRES_PASSWORD }}
           CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
