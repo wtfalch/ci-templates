@@ -95,49 +95,45 @@ jobs:
           set -euo pipefail
           STACK_DIR="/opt/stack/${APP_NAME}"
 
-          # Pipe the compose file as a tar to ssh's stdin. The remote-side
-          # script extracts to a tmpdir, validates with `docker compose config`
-          # (which catches yaml syntax errors AND env-interpolation problems
-          # against the live .env), atomically swaps in via mv, then applies.
-          # If anything fails before the swap, the live compose is untouched.
+          # Pipe the compose file as a tar to ssh's stdin. The whole remote
+          # script is passed as ssh's command argument (NOT via `bash -s`
+          # heredoc, which would consume stdin and leave nothing for the
+          # remote `tar -xf -`). Variables are interpolated locally; the
+          # script itself uses single-quotes wherever possible to keep
+          # remote-shell escaping minimal.
+          #
+          # Validation: `docker compose config -q` against the live .env
+          # catches yaml syntax errors and env-interpolation problems.
+          # Atomic swap via mv only happens after validation passes; on any
+          # failure before the swap, the live compose is untouched.
           tar -cf - docker-compose.yml | \
           ssh -i ~/.ssh/id_ed25519 \
               -o StrictHostKeyChecking=no \
               -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
               "${SSH_USER}@${HOST}" \
-              "STACK_DIR='${STACK_DIR}' SERVICE='${SERVICE}' bash -s" <<'REMOTE'
-          set -euo pipefail
-          cd "$STACK_DIR"
-          rm -rf .compose-deploy-tmp
-          mkdir -p .compose-deploy-tmp
-          tar -xf - -C .compose-deploy-tmp
-
-          # Validate the NEW file with the live .env (parent dir). Compose
-          # resolves .env relative to the compose file's location; --env-file
-          # overrides that to use the live one. Errors here = file rejected,
-          # live compose untouched.
-          if ! docker compose -f .compose-deploy-tmp/docker-compose.yml --env-file .env config -q; then
-            echo '::error::compose validation failed; live compose left in place'
-            rm -rf .compose-deploy-tmp
-            exit 1
-          fi
-
-          # Backup + atomic swap. The .bak file is the rollback handle:
-          #   ssh root@lxc 'cd /opt/stack/{app}; cp docker-compose.yml.bak docker-compose.yml && docker compose up -d --remove-orphans'
-          cp docker-compose.yml docker-compose.yml.bak
-          mv .compose-deploy-tmp/docker-compose.yml docker-compose.yml
-          rmdir .compose-deploy-tmp
-
-          # Apply. Compose figures out which services actually changed
-          # (image / labels / env / networks / volumes) and recreates only
-          # those. --remove-orphans cleans up services deleted from compose.
-          if [ -n "$SERVICE" ]; then
-            docker compose up -d --remove-orphans "$SERVICE"
-          else
-            docker compose up -d --remove-orphans
-          fi
-
-          docker compose ps --format 'table {{.Name}}\t{{.Status}}'
-          REMOTE
+              "set -euo pipefail
+               cd '${STACK_DIR}'
+               rm -rf .compose-deploy-tmp
+               mkdir -p .compose-deploy-tmp
+               tar -xf - -C .compose-deploy-tmp
+               if ! docker compose -f .compose-deploy-tmp/docker-compose.yml --env-file .env config -q; then
+                 echo '::error::compose validation failed; live compose left in place'
+                 rm -rf .compose-deploy-tmp
+                 exit 1
+               fi
+               # Backup + atomic swap. .bak is the rollback handle:
+               #   ssh root@lxc 'cd /opt/stack/{app}; cp docker-compose.yml.bak docker-compose.yml && docker compose up -d --remove-orphans'
+               cp docker-compose.yml docker-compose.yml.bak
+               mv .compose-deploy-tmp/docker-compose.yml docker-compose.yml
+               rmdir .compose-deploy-tmp
+               # Apply. Compose figures out which services actually changed
+               # (image / labels / env / networks / volumes) and recreates
+               # only those. --remove-orphans cleans up deleted services.
+               if [ -n '${SERVICE}' ]; then
+                 docker compose up -d --remove-orphans '${SERVICE}'
+               else
+                 docker compose up -d --remove-orphans
+               fi
+               docker compose ps --format 'table {{.Name}}\t{{.Status}}'"
 
           echo "::notice::compose deploy applied for ${APP_NAME}"
