@@ -125,6 +125,24 @@ jobs:
             echo "  phone_change = COALESCE(phone_change, ''),"
             echo "  phone_change_token = COALESCE(phone_change_token, ''),"
             echo "  reauthentication_token = COALESCE(reauthentication_token, '');"
+            # pg_dump --no-owner sets ownership of restored objects to
+            # whoever runs the SQL (supabase_admin in this script). gotrue's
+            # first-boot migration runs `comment on table auth.users` which
+            # requires ownership of those tables — fails as supabase_auth_admin
+            # because supabase_admin owns everything. Reassign auth schema +
+            # all its tables/sequences/functions to supabase_auth_admin.
+            echo "ALTER SCHEMA auth OWNER TO supabase_auth_admin;"
+            echo "DO \$do\$ DECLARE r record; BEGIN"
+            echo "  FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'auth' LOOP"
+            echo "    EXECUTE 'ALTER TABLE auth.' || quote_ident(r.tablename) || ' OWNER TO supabase_auth_admin';"
+            echo "  END LOOP;"
+            echo "  FOR r IN SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = 'auth' LOOP"
+            echo "    EXECUTE 'ALTER SEQUENCE auth.' || quote_ident(r.sequence_name) || ' OWNER TO supabase_auth_admin';"
+            echo "  END LOOP;"
+            echo "  FOR r IN SELECT routine_name FROM information_schema.routines WHERE routine_schema = 'auth' AND routine_type = 'FUNCTION' LOOP"
+            echo "    EXECUTE 'ALTER FUNCTION auth.' || quote_ident(r.routine_name) || ' OWNER TO supabase_auth_admin';"
+            echo "  END LOOP;"
+            echo "END \$do\$;"
             # pg_dump --no-privileges strips GRANTs (we use it to avoid
             # GRANTing to prod-only roles that don't exist on stage). But
             # gotrue + postgrest need the standard supabase grants on the
