@@ -47,6 +47,13 @@ on:
         required: true
       PREVIEW_SERVICE_ROLE_KEY:
         required: true
+      NEXT_PUBLIC_SENTRY_DSN:
+        description: |
+          Sentry DSN. Same value as prod; stage tags events with
+          environment=stage so prod alerts can filter on
+          environment:production while stage events stay visible for
+          debugging. Optional — empty string skips Sentry init entirely.
+        required: false
 
 permissions:
   contents: read
@@ -83,6 +90,8 @@ jobs:
           build-args: |
             NEXT_PUBLIC_SUPABASE_URL=https://stage.${{ inputs.app-domain }}/supabase
             NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.PREVIEW_ANON_KEY }}
+            NEXT_PUBLIC_SENTRY_DSN=${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+            NEXT_PUBLIC_SENTRY_ENVIRONMENT=stage
           cache-from: |
             type=gha
             type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.app-name }}:buildcache
@@ -117,6 +126,7 @@ jobs:
           JWT_SECRET: ${{ secrets.PREVIEW_JWT_SECRET }}
           ANON_KEY: ${{ secrets.PREVIEW_ANON_KEY }}
           SERVICE_ROLE_KEY: ${{ secrets.PREVIEW_SERVICE_ROLE_KEY }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
         run: |
           set -euo pipefail
           for f in stage/compose.template.yml stage/.env.template stage/kong.template.yml; do
@@ -126,7 +136,7 @@ jobs:
             fi
           done
           mkdir -p rendered
-          VARS='$APP_NAME $APP_DOMAIN $GHCR_OWNER $POSTGRES_PASSWORD $JWT_SECRET $ANON_KEY $SERVICE_ROLE_KEY'
+          VARS='$APP_NAME $APP_DOMAIN $GHCR_OWNER $POSTGRES_PASSWORD $JWT_SECRET $ANON_KEY $SERVICE_ROLE_KEY $NEXT_PUBLIC_SENTRY_DSN'
           envsubst "$VARS" < stage/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < stage/.env.template        > rendered/.env
           envsubst "$VARS" < stage/kong.template.yml    > rendered/kong.yml

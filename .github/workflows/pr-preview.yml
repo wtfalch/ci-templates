@@ -59,6 +59,13 @@ on:
       PREVIEW_SERVICE_ROLE_KEY:
         description: Same as PREVIEW_ANON_KEY but role=service_role.
         required: true
+      NEXT_PUBLIC_SENTRY_DSN:
+        description: |
+          Sentry DSN. Same value as prod; per-PR previews tag events with
+          environment=preview-pr-{N} so prod alerts can filter on
+          environment:production while preview events stay visible for
+          debugging. Optional — empty string skips Sentry init entirely.
+        required: false
 
 permissions:
   contents: read
@@ -112,6 +119,8 @@ jobs:
           build-args: |
             NEXT_PUBLIC_SUPABASE_URL=https://pr-${{ github.event.pull_request.number }}-preview.${{ inputs.app-domain }}/supabase
             NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.PREVIEW_ANON_KEY }}
+            NEXT_PUBLIC_SENTRY_DSN=${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+            NEXT_PUBLIC_SENTRY_ENVIRONMENT=preview-pr-${{ github.event.pull_request.number }}
           cache-from: |
             type=gha
             type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.app-name }}:buildcache
@@ -144,6 +153,11 @@ jobs:
           GHCR_OWNER: ${{ github.repository_owner }}
           ANON_KEY: ${{ secrets.PREVIEW_ANON_KEY }}
           SERVICE_ROLE_KEY: ${{ secrets.PREVIEW_SERVICE_ROLE_KEY }}
+          # Stage and per-PR previews share a Postgres password (the per-PR
+          # web container connects directly to stage-${APP_NAME}-db over
+          # `pr-shared` for Drizzle / postgres-js queries that bypass kong).
+          POSTGRES_PASSWORD: ${{ secrets.PREVIEW_POSTGRES_PASSWORD }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
         run: |
           set -euo pipefail
           for f in preview/compose.template.yml preview/.env.template; do
@@ -153,10 +167,10 @@ jobs:
             fi
           done
           mkdir -p rendered
-          # Per-PR previews now share stage's supabase stack — no kong.yml
-          # or init-roles.sh per PR. POSTGRES_PASSWORD / JWT_SECRET are not
-          # needed in the per-PR .env since the per-PR compose has no DB.
-          VARS='$PR_NUMBER $APP_NAME $APP_DOMAIN $GHCR_OWNER $ANON_KEY $SERVICE_ROLE_KEY'
+          # Per-PR previews share stage's supabase stack. POSTGRES_PASSWORD is
+          # threaded so DATABASE_URL in preview/.env can hit stage's db
+          # directly. JWT_SECRET stays per-stage-only.
+          VARS='$PR_NUMBER $APP_NAME $APP_DOMAIN $GHCR_OWNER $ANON_KEY $SERVICE_ROLE_KEY $POSTGRES_PASSWORD $NEXT_PUBLIC_SENTRY_DSN'
           envsubst "$VARS" < preview/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < preview/.env.template        > rendered/.env
 
