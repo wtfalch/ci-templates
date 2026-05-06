@@ -56,6 +56,12 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends postgresql-client-17
+          # Ubuntu 24.04 GH runners ship pg 16 client preinstalled. apt
+          # leaves /usr/bin/pg_dump pointing at pg 16, which then refuses
+          # to run against Supabase Cloud (pg 17): "aborting because of
+          # server version mismatch". Prepend pg 17's bindir so subsequent
+          # steps resolve pg_dump to the pg 17 binary.
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           sudo chmod +x /usr/local/bin/cloudflared
