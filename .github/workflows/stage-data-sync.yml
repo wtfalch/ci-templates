@@ -99,19 +99,21 @@ jobs:
             echo "DROP SCHEMA IF EXISTS auth CASCADE;"
             echo "CREATE SCHEMA public;"
             echo "CREATE SCHEMA auth;"
-            # pg_dump 17.5+ emits `\restrict <tag>` / `\unrestrict <tag>`
-            # psql metacommands at the top + bottom of the dump to lock down
-            # search_path during restore (CVE-2025-1094 mitigation). Stage's
-            # supabase/postgres:15.1.1.78 ships psql 15, which errors with
-            # "invalid command \restrict" and aborts the restore, leaving
-            # stage's schemas dropped but not repopulated. Strip both lines.
+            # pg_dump 17 emits constructs that pre-17 servers (e.g. stage's
+            # supabase/postgres:15.1.1.78) reject and abort restore on:
+            #   - `\restrict <tag>` / `\unrestrict <tag>` psql metacommands
+            #     (added 17.5 for CVE-2025-1094 search-path mitigation)
+            #   - `SET transaction_timeout = N;` (GUC added in pg 17)
+            # Strip both kinds. They're either purely client-side or
+            # session-scoped and don't affect the dump's data integrity.
+            # If/when stage moves to pg 17, this filter can be removed.
             pg_dump "$PROD_DATABASE_URL" \
               --no-owner \
               --no-privileges \
               --no-comments \
               --schema=public \
               --schema=auth \
-              | grep -vE '^\\(restrict|unrestrict) '
+              | grep -vE '^\\(restrict|unrestrict) |^SET transaction_timeout '
             echo "UPDATE auth.users SET"
             echo "  confirmation_token = COALESCE(confirmation_token, ''),"
             echo "  recovery_token = COALESCE(recovery_token, ''),"
