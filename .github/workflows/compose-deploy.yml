@@ -1,0 +1,143 @@
+name: Compose deploy
+
+# Reusable workflow that ships the consumer repo's docker-compose.yml to the
+# LXC and applies it. Caller workflows trigger this on push-to-main when
+# docker-compose.yml changes.
+#
+# Why this exists: the prod compose lives at /opt/stack/{app}/docker-compose.yml
+# on the LXC. It was originally written by `bootstrap/07-lxc-stack.ts` at
+# bootstrap time, then hand-edited as needed. Hand-editing leaves the LXC and
+# the repo drifting and means small infra changes (Caddy label, env tweak,
+# image bump) need SSH access. Treating docker-compose.yml in the app repo as
+# the source of truth + this workflow shipping it on push closes the loop:
+#
+#   1. Edit docker-compose.yml in the app repo.
+#   2. PR diff shows exactly what changes on the LXC.
+#   3. On merge: workflow validates the new file, backs up the live one,
+#      atomically swaps, then `docker compose up -d --remove-orphans`
+#      reconciles. Compose recreates only services whose image / env /
+#      networks / labels changed; the rest stay running.
+#
+# Out of scope: building images (deploy.yml does that), running migrations,
+# editing .env (which has secrets that don't belong in the repo).
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: App slug — used for the compose project at /opt/stack/{app}.
+        type: string
+        required: true
+      service:
+        description: |
+          Optional: limit recreation to a single service. Useful when you
+          changed labels on one container only and want to avoid touching
+          others. Defaults to empty (full `up -d --remove-orphans`).
+        type: string
+        required: false
+        default: ''
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      CF_ACCESS_CLIENT_ID:
+        required: true
+      CF_ACCESS_CLIENT_SECRET:
+        required: true
+
+permissions:
+  contents: read
+
+# One compose deploy at a time per app. Two pushes racing `docker compose up`
+# would interleave container recreates and leave the stack indeterminate.
+concurrency:
+  group: compose-deploy-${{ inputs.app-name }}
+  cancel-in-progress: false
+
+jobs:
+  ship:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml present
+        run: |
+          if [ ! -f docker-compose.yml ]; then
+            echo "::error::docker-compose.yml missing at repo root. This workflow ships that file to /opt/stack/${{ inputs.app-name }}/ on the LXC."
+            exit 1
+          fi
+          echo "compose file size: $(wc -c < docker-compose.yml) bytes"
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Ship compose + apply
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          APP_NAME: ${{ inputs.app-name }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          STACK_DIR="/opt/stack/${APP_NAME}"
+
+          # Pipe the compose file as a tar to ssh's stdin. The remote-side
+          # script extracts to a tmpdir, validates with `docker compose config`
+          # (which catches yaml syntax errors AND env-interpolation problems
+          # against the live .env), atomically swaps in via mv, then applies.
+          # If anything fails before the swap, the live compose is untouched.
+          tar -cf - docker-compose.yml | \
+          ssh -i ~/.ssh/id_ed25519 \
+              -o StrictHostKeyChecking=no \
+              -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
+              "${SSH_USER}@${HOST}" \
+              "STACK_DIR='${STACK_DIR}' SERVICE='${SERVICE}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$STACK_DIR"
+          rm -rf .compose-deploy-tmp
+          mkdir -p .compose-deploy-tmp
+          tar -xf - -C .compose-deploy-tmp
+
+          # Validate the NEW file with the live .env (parent dir). Compose
+          # resolves .env relative to the compose file's location; --env-file
+          # overrides that to use the live one. Errors here = file rejected,
+          # live compose untouched.
+          if ! docker compose -f .compose-deploy-tmp/docker-compose.yml --env-file .env config -q; then
+            echo '::error::compose validation failed; live compose left in place'
+            rm -rf .compose-deploy-tmp
+            exit 1
+          fi
+
+          # Backup + atomic swap. The .bak file is the rollback handle:
+          #   ssh root@lxc 'cd /opt/stack/{app}; cp docker-compose.yml.bak docker-compose.yml && docker compose up -d --remove-orphans'
+          cp docker-compose.yml docker-compose.yml.bak
+          mv .compose-deploy-tmp/docker-compose.yml docker-compose.yml
+          rmdir .compose-deploy-tmp
+
+          # Apply. Compose figures out which services actually changed
+          # (image / labels / env / networks / volumes) and recreates only
+          # those. --remove-orphans cleans up services deleted from compose.
+          if [ -n "$SERVICE" ]; then
+            docker compose up -d --remove-orphans "$SERVICE"
+          else
+            docker compose up -d --remove-orphans
+          fi
+
+          docker compose ps --format 'table {{.Name}}\t{{.Status}}'
+          REMOTE
+
+          echo "::notice::compose deploy applied for ${APP_NAME}"
