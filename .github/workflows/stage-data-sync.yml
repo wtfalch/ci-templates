@@ -125,6 +125,19 @@ jobs:
             echo "  phone_change = COALESCE(phone_change, ''),"
             echo "  phone_change_token = COALESCE(phone_change_token, ''),"
             echo "  reauthentication_token = COALESCE(reauthentication_token, '');"
+            # pg_dump --no-privileges strips GRANTs (we use it to avoid
+            # GRANTing to prod-only roles that don't exist on stage). But
+            # gotrue + postgrest need the standard supabase grants on the
+            # restored schemas to function. Re-apply them by hand.
+            echo "GRANT USAGE, CREATE ON SCHEMA auth TO supabase_auth_admin;"
+            echo "GRANT ALL ON ALL TABLES IN SCHEMA auth TO supabase_auth_admin;"
+            echo "GRANT ALL ON ALL SEQUENCES IN SCHEMA auth TO supabase_auth_admin;"
+            echo "GRANT ALL ON ALL FUNCTIONS IN SCHEMA auth TO supabase_auth_admin;"
+            echo "GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;"
+            echo "GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;"
+            echo "GRANT SELECT ON ALL TABLES IN SCHEMA public TO anon, authenticated;"
+            echo "GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;"
+            echo "GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;"
             echo "SET session_replication_role = 'origin';"
             echo "COMMIT;"
           } | ssh -i ~/.ssh/id_ed25519 \
