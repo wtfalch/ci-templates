@@ -1,0 +1,68 @@
+name: Decrypt SOPS+age secrets
+description: >-
+  Installs sops if missing, then decrypts a SOPS-encrypted dotenv file using
+  SOPS_AGE_KEY (must be in env, typically from a GH repo secret). Writes the
+  decrypted content to <output-file>; subsequent workflow steps `source` it
+  to load env vars, or read it directly.
+#
+# Why a composite action and not just inline `sops -d` in each workflow:
+#   - centralizes the install-if-missing dance (sops isn't on every runner)
+#   - one place to update the version pin
+#   - lets caller workflows invoke it as a single `uses:` step
+#
+# Caller pattern:
+#   - uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
+#     with:
+#       env-file: secrets/prod.env
+#       output-file: .env
+#     env:
+#       SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+
+inputs:
+  env-file:
+    description: Path to the SOPS-encrypted dotenv file in the checked-out repo
+    required: true
+  output-file:
+    description: Path to write decrypted content to
+    default: .env
+  sops-version:
+    description: Pinned sops version (only used if sops isn't already on PATH)
+    default: '3.9.4'
+
+runs:
+  using: composite
+  steps:
+    - name: Install sops (if missing)
+      shell: bash
+      run: |
+        if command -v sops >/dev/null 2>&1; then
+          echo "sops $(sops --version | head -1) already installed"
+          exit 0
+        fi
+        VERSION="${{ inputs.sops-version }}"
+        URL="https://github.com/getsops/sops/releases/download/v${VERSION}/sops-v${VERSION}.linux.amd64"
+        curl -fsSL "$URL" -o /tmp/sops
+        sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+        rm /tmp/sops
+        echo "installed sops $(sops --version | head -1)"
+
+    - name: Verify SOPS_AGE_KEY is present
+      shell: bash
+      run: |
+        if [ -z "${SOPS_AGE_KEY:-}" ]; then
+          echo "::error::SOPS_AGE_KEY env var is empty. Set it from secrets.SOPS_AGE_KEY on the calling job."
+          exit 1
+        fi
+
+    - name: Decrypt
+      shell: bash
+      run: |
+        if [ ! -f "${{ inputs.env-file }}" ]; then
+          echo "::error::encrypted file not found: ${{ inputs.env-file }}"
+          exit 1
+        fi
+        # The encrypted file is dotenv-formatted; preserve the format on the way out.
+        sops --decrypt --input-type dotenv --output-type dotenv \
+          --output "${{ inputs.output-file }}" \
+          "${{ inputs.env-file }}"
+        echo "::notice::decrypted ${{ inputs.env-file }} → ${{ inputs.output-file }}"
