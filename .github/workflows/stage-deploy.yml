@@ -28,6 +28,15 @@ on:
         type: string
         required: false
         default: '22'
+      sops-stage-env-file:
+        description: >-
+          Path to SOPS-encrypted dotenv with stage's runtime secrets. The
+          workflow extracts POSTGRES_PASSWORD (from DATABASE_URL),
+          JWT_SECRET, NEXT_PUBLIC_SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY,
+          NEXT_PUBLIC_SENTRY_DSN, RESEND_API_KEY and renders compose +
+          .env templates with them.
+        type: string
+        required: true
     secrets:
       DEPLOY_SSH_KEY:
         required: true
@@ -39,28 +48,9 @@ on:
         required: true
       CF_ACCESS_CLIENT_SECRET:
         required: true
-      PREVIEW_POSTGRES_PASSWORD:
+      SOPS_AGE_KEY:
+        description: age private key for decrypting sops-stage-env-file.
         required: true
-      PREVIEW_JWT_SECRET:
-        required: true
-      PREVIEW_ANON_KEY:
-        required: true
-      PREVIEW_SERVICE_ROLE_KEY:
-        required: true
-      NEXT_PUBLIC_SENTRY_DSN:
-        description: |
-          Sentry DSN. Same value as prod; stage tags events with
-          environment=stage so prod alerts can filter on
-          environment:production while stage events stay visible for
-          debugging. Optional — empty string skips Sentry init entirely.
-        required: false
-      RESEND_API_TOKEN:
-        description: |
-          Resend API token. Used at runtime by stage's gotrue for SMTP send
-          (auth flows: signup, magic link, password reset) and by any app-
-          level Resend SDK calls. Optional — empty string falls back to
-          gotrue's default (errors on send rather than silently dropping).
-        required: false
 
 permissions:
   contents: read
@@ -79,6 +69,24 @@ jobs:
       image-tag: stage
     steps:
       - uses: actions/checkout@v4
+
+      - uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
+        with:
+          env-file: ${{ inputs.sops-stage-env-file }}
+          output-file: /tmp/sops.env
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+
+      - name: Source build-time secrets to GITHUB_ENV
+        # NEXT_PUBLIC_SUPABASE_ANON_KEY + NEXT_PUBLIC_SENTRY_DSN come from
+        # the encrypted file. Mask + propagate.
+        run: |
+          for key in NEXT_PUBLIC_SUPABASE_ANON_KEY NEXT_PUBLIC_SENTRY_DSN; do
+            val=$(grep "^${key}=" /tmp/sops.env | cut -d= -f2-)
+            echo "::add-mask::${val}"
+            echo "${key}=${val}" >> "$GITHUB_ENV"
+          done
+
       - uses: docker/setup-buildx-action@v3
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -96,8 +104,8 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.app-name }}:stage
           build-args: |
             NEXT_PUBLIC_SUPABASE_URL=https://stage.${{ inputs.app-domain }}/supabase
-            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.PREVIEW_ANON_KEY }}
-            NEXT_PUBLIC_SENTRY_DSN=${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ env.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+            NEXT_PUBLIC_SENTRY_DSN=${{ env.NEXT_PUBLIC_SENTRY_DSN }}
             NEXT_PUBLIC_SENTRY_ENVIRONMENT=stage
           cache-from: |
             type=gha
@@ -124,17 +132,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
+        with:
+          env-file: ${{ inputs.sops-stage-env-file }}
+          output-file: /tmp/sops.env
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+
+      - name: Source render-time secrets from SOPS
+        # Map the SOPS file's runtime names into the names the templates
+        # expect (envsubst variable names — POSTGRES_PASSWORD, ANON_KEY,
+        # SERVICE_ROLE_KEY, etc.). POSTGRES_PASSWORD is parsed out of
+        # DATABASE_URL since the encrypted file doesn't keep it standalone.
+        run: |
+          db_url=$(grep '^DATABASE_URL=' /tmp/sops.env | cut -d= -f2-)
+          pg_pass=$(printf '%s' "$db_url" | sed -E 's|^postgres(ql)?://[^:]+:([^@]+)@.*$|\2|')
+          jwt=$(grep '^JWT_SECRET=' /tmp/sops.env | cut -d= -f2-)
+          anon=$(grep '^NEXT_PUBLIC_SUPABASE_ANON_KEY=' /tmp/sops.env | cut -d= -f2-)
+          srv=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' /tmp/sops.env | cut -d= -f2-)
+          dsn=$(grep '^NEXT_PUBLIC_SENTRY_DSN=' /tmp/sops.env | cut -d= -f2-)
+          resend=$(grep '^RESEND_API_KEY=' /tmp/sops.env | cut -d= -f2-)
+          for v in "$pg_pass" "$jwt" "$anon" "$srv"; do
+            [ -z "$v" ] && { echo "::error::missing required secret in SOPS file"; exit 1; }
+          done
+          for v in "$pg_pass" "$jwt" "$anon" "$srv" "$dsn" "$resend"; do
+            [ -n "$v" ] && echo "::add-mask::${v}"
+          done
+          {
+            echo "POSTGRES_PASSWORD=${pg_pass}"
+            echo "JWT_SECRET=${jwt}"
+            echo "ANON_KEY=${anon}"
+            echo "SERVICE_ROLE_KEY=${srv}"
+            echo "NEXT_PUBLIC_SENTRY_DSN=${dsn}"
+            echo "RESEND_API_TOKEN=${resend}"
+          } >> "$GITHUB_ENV"
+          rm /tmp/sops.env
+
       - name: Render compose + .env + kong.yml from templates
         env:
           APP_NAME: ${{ inputs.app-name }}
           APP_DOMAIN: ${{ inputs.app-domain }}
           GHCR_OWNER: ${{ github.repository_owner }}
-          POSTGRES_PASSWORD: ${{ secrets.PREVIEW_POSTGRES_PASSWORD }}
-          JWT_SECRET: ${{ secrets.PREVIEW_JWT_SECRET }}
-          ANON_KEY: ${{ secrets.PREVIEW_ANON_KEY }}
-          SERVICE_ROLE_KEY: ${{ secrets.PREVIEW_SERVICE_ROLE_KEY }}
-          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
-          RESEND_API_TOKEN: ${{ secrets.RESEND_API_TOKEN }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          JWT_SECRET: ${{ env.JWT_SECRET }}
+          ANON_KEY: ${{ env.ANON_KEY }}
+          SERVICE_ROLE_KEY: ${{ env.SERVICE_ROLE_KEY }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ env.NEXT_PUBLIC_SENTRY_DSN }}
+          RESEND_API_TOKEN: ${{ env.RESEND_API_TOKEN }}
         run: |
           set -euo pipefail
           for f in stage/compose.template.yml stage/.env.template stage/kong.template.yml; do
