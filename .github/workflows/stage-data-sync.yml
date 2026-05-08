@@ -17,6 +17,18 @@ on:
       app-name:
         type: string
         required: true
+      sops-prod-env-file:
+        description: >-
+          Path to SOPS-encrypted dotenv whose DATABASE_URL is the prod source
+          for the pg_dump. Required.
+        type: string
+        required: true
+      sops-stage-env-file:
+        description: >-
+          Path to SOPS-encrypted dotenv whose POSTGRES_PASSWORD is the stage
+          target's supabase_admin password. Required.
+        type: string
+        required: true
     secrets:
       DEPLOY_SSH_KEY:
         required: true
@@ -28,10 +40,8 @@ on:
         required: true
       CF_ACCESS_CLIENT_SECRET:
         required: true
-      DATABASE_URL:
-        description: Direct (non-pooler) Postgres connection string for prod.
-        required: true
-      PREVIEW_POSTGRES_PASSWORD:
+      SOPS_AGE_KEY:
+        description: age private key for decrypting sops-env-file.
         required: true
 
 permissions:
@@ -46,6 +56,42 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Decrypt prod SOPS env (source DATABASE_URL)
+        uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
+        with:
+          env-file: ${{ inputs.sops-prod-env-file }}
+          output-file: /tmp/sops-prod.env
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+
+      - name: Decrypt stage SOPS env (source POSTGRES_PASSWORD)
+        uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
+        with:
+          env-file: ${{ inputs.sops-stage-env-file }}
+          output-file: /tmp/sops-stage.env
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+
+      - name: Source runtime secrets to GITHUB_ENV
+        run: |
+          db_url=$(grep '^DATABASE_URL=' /tmp/sops-prod.env | cut -d= -f2-)
+          if [ -z "$db_url" ]; then
+            echo "::error::DATABASE_URL missing from ${{ inputs.sops-prod-env-file }}"; exit 1
+          fi
+          pg_pass=$(grep '^POSTGRES_PASSWORD=' /tmp/sops-stage.env | cut -d= -f2-)
+          if [ -z "$pg_pass" ]; then
+            echo "::error::POSTGRES_PASSWORD missing from ${{ inputs.sops-stage-env-file }}"; exit 1
+          fi
+          echo "::add-mask::${db_url}"
+          echo "::add-mask::${pg_pass}"
+          {
+            echo "PROD_DATABASE_URL=${db_url}"
+            echo "STAGE_POSTGRES_PASSWORD=${pg_pass}"
+          } >> "$GITHUB_ENV"
+          rm /tmp/sops-prod.env /tmp/sops-stage.env
+
       - name: Install psql 17 + cloudflared
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -74,8 +120,11 @@ jobs:
 
       - name: pg_dump prod → restore stage
         env:
-          PROD_DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          PREVIEW_POSTGRES_PASSWORD: ${{ secrets.PREVIEW_POSTGRES_PASSWORD }}
+          # PROD_DATABASE_URL + STAGE_POSTGRES_PASSWORD come from SOPS via
+          # GITHUB_ENV. The script body uses these var names directly so the
+          # rest of the original shape (the heredoc'd SQL) is unchanged.
+          PROD_DATABASE_URL: ${{ env.PROD_DATABASE_URL }}
+          PREVIEW_POSTGRES_PASSWORD: ${{ env.STAGE_POSTGRES_PASSWORD }}
           CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           HOST: ${{ secrets.DEPLOY_HOST }}
