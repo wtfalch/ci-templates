@@ -75,14 +75,24 @@ jobs:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
 
       - name: Source runtime secrets to GITHUB_ENV
+        # POSTGRES_PASSWORD lives inside stage.env's DATABASE_URL
+        # (postgres://supabase_admin:<PASS>@...). Extract via parameter
+        # expansion rather than requiring callers to add a duplicate
+        # POSTGRES_PASSWORD field to the encrypted file.
         run: |
           db_url=$(grep '^DATABASE_URL=' /tmp/sops-prod.env | cut -d= -f2-)
           if [ -z "$db_url" ]; then
             echo "::error::DATABASE_URL missing from ${{ inputs.sops-prod-env-file }}"; exit 1
           fi
-          pg_pass=$(grep '^POSTGRES_PASSWORD=' /tmp/sops-stage.env | cut -d= -f2-)
-          if [ -z "$pg_pass" ]; then
-            echo "::error::POSTGRES_PASSWORD missing from ${{ inputs.sops-stage-env-file }}"; exit 1
+          stage_db_url=$(grep '^DATABASE_URL=' /tmp/sops-stage.env | cut -d= -f2-)
+          if [ -z "$stage_db_url" ]; then
+            echo "::error::DATABASE_URL missing from ${{ inputs.sops-stage-env-file }}"; exit 1
+          fi
+          # Extract password between :supabase_admin: and @ — simple sed,
+          # works for any postgres URL whose user is supabase_admin.
+          pg_pass=$(printf '%s' "$stage_db_url" | sed -E 's|^postgres(ql)?://[^:]+:([^@]+)@.*$|\2|')
+          if [ -z "$pg_pass" ] || [ "$pg_pass" = "$stage_db_url" ]; then
+            echo "::error::could not parse password from stage DATABASE_URL"; exit 1
           fi
           echo "::add-mask::${db_url}"
           echo "::add-mask::${pg_pass}"
