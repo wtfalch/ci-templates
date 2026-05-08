@@ -29,6 +29,14 @@ on:
         type: string
         required: false
         default: '22'
+      sops-stage-env-file:
+        description: >-
+          Path to SOPS-encrypted dotenv with stage-shared runtime secrets.
+          Per-PR previews share stage's backend, so they consume the same
+          values (POSTGRES_PASSWORD via DATABASE_URL, JWT_SECRET, anon/service
+          role keys, Sentry, Resend).
+        type: string
+        required: true
     secrets:
       DEPLOY_SSH_KEY:
         required: true
@@ -40,40 +48,9 @@ on:
         required: true
       CF_ACCESS_CLIENT_SECRET:
         required: true
-      PREVIEW_POSTGRES_PASSWORD:
-        description: |
-          Static password used inside the per-PR Postgres container. Not exposed
-          to the public internet; the DB binds only to the per-PR docker network.
-          Set once per app via gh-secrets.
+      SOPS_AGE_KEY:
+        description: age private key for decrypting sops-stage-env-file.
         required: true
-      PREVIEW_JWT_SECRET:
-        description: |
-          Shared HS256 JWT secret for the per-PR GoTrue + PostgREST. ≥32 chars.
-          All previews of this app share the same secret (so anon/service keys
-          are constant across PRs); per-PR isolation comes from network
-          namespacing, not key rotation. Set once at bootstrap.
-        required: true
-      PREVIEW_ANON_KEY:
-        description: HS256 JWT pre-signed with PREVIEW_JWT_SECRET, role=anon, exp far in the future.
-        required: true
-      PREVIEW_SERVICE_ROLE_KEY:
-        description: Same as PREVIEW_ANON_KEY but role=service_role.
-        required: true
-      NEXT_PUBLIC_SENTRY_DSN:
-        description: |
-          Sentry DSN. Same value as prod; per-PR previews tag events with
-          environment=preview-pr-{N} so prod alerts can filter on
-          environment:production while preview events stay visible for
-          debugging. Optional — empty string skips Sentry init entirely.
-        required: false
-      RESEND_API_TOKEN:
-        description: |
-          Resend API token. Available at runtime to per-PR web containers
-          for app-level Resend SDK calls. (Per-PR previews share stage's
-          gotrue, so SMTP-via-Resend for auth is configured stage-side.)
-          Optional — empty string falls back to runtime errors when send
-          is attempted.
-        required: false
 
 permissions:
   contents: read
@@ -111,6 +88,21 @@ jobs:
         id: tag
         run: echo "tag=pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
 
+      - uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
+        with:
+          env-file: ${{ inputs.sops-stage-env-file }}
+          output-file: /tmp/sops.env
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+
+      - name: Source build-time secrets to GITHUB_ENV
+        run: |
+          for key in NEXT_PUBLIC_SUPABASE_ANON_KEY NEXT_PUBLIC_SENTRY_DSN; do
+            val=$(grep "^${key}=" /tmp/sops.env | cut -d= -f2-)
+            echo "::add-mask::${val}"
+            echo "${key}=${val}" >> "$GITHUB_ENV"
+          done
+
       # NEXT_PUBLIC_SUPABASE_URL points at /supabase under the SAME hostname
       # as the app — Caddy strips that prefix and proxies to kong. Single
       # origin keeps requests same-origin (Cloudflare Access cookie is host-
@@ -126,8 +118,8 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.app-name }}:${{ steps.tag.outputs.tag }}
           build-args: |
             NEXT_PUBLIC_SUPABASE_URL=https://pr-${{ github.event.pull_request.number }}-preview.${{ inputs.app-domain }}/supabase
-            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.PREVIEW_ANON_KEY }}
-            NEXT_PUBLIC_SENTRY_DSN=${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ env.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+            NEXT_PUBLIC_SENTRY_DSN=${{ env.NEXT_PUBLIC_SENTRY_DSN }}
             NEXT_PUBLIC_SENTRY_ENVIRONMENT=preview-pr-${{ github.event.pull_request.number }}
           cache-from: |
             type=gha
@@ -153,20 +145,50 @@ jobs:
         id: url
         run: echo "url=https://pr-${{ github.event.pull_request.number }}-preview.${{ inputs.app-domain }}" >> "$GITHUB_OUTPUT"
 
+      - uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
+        with:
+          env-file: ${{ inputs.sops-stage-env-file }}
+          output-file: /tmp/sops.env
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+
+      - name: Source render-time secrets from SOPS
+        run: |
+          db_url=$(grep '^DATABASE_URL=' /tmp/sops.env | cut -d= -f2-)
+          pg_pass=$(printf '%s' "$db_url" | sed -E 's|^postgres(ql)?://[^:]+:([^@]+)@.*$|\2|')
+          anon=$(grep '^NEXT_PUBLIC_SUPABASE_ANON_KEY=' /tmp/sops.env | cut -d= -f2-)
+          srv=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' /tmp/sops.env | cut -d= -f2-)
+          dsn=$(grep '^NEXT_PUBLIC_SENTRY_DSN=' /tmp/sops.env | cut -d= -f2-)
+          resend=$(grep '^RESEND_API_KEY=' /tmp/sops.env | cut -d= -f2-)
+          for v in "$pg_pass" "$anon" "$srv"; do
+            [ -z "$v" ] && { echo "::error::missing required secret in SOPS file"; exit 1; }
+          done
+          for v in "$pg_pass" "$anon" "$srv" "$dsn" "$resend"; do
+            [ -n "$v" ] && echo "::add-mask::${v}"
+          done
+          {
+            echo "POSTGRES_PASSWORD=${pg_pass}"
+            echo "ANON_KEY=${anon}"
+            echo "SERVICE_ROLE_KEY=${srv}"
+            echo "NEXT_PUBLIC_SENTRY_DSN=${dsn}"
+            echo "RESEND_API_TOKEN=${resend}"
+          } >> "$GITHUB_ENV"
+          rm /tmp/sops.env
+
       - name: Render compose + .env from templates
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           APP_NAME: ${{ inputs.app-name }}
           APP_DOMAIN: ${{ inputs.app-domain }}
           GHCR_OWNER: ${{ github.repository_owner }}
-          ANON_KEY: ${{ secrets.PREVIEW_ANON_KEY }}
-          SERVICE_ROLE_KEY: ${{ secrets.PREVIEW_SERVICE_ROLE_KEY }}
+          ANON_KEY: ${{ env.ANON_KEY }}
+          SERVICE_ROLE_KEY: ${{ env.SERVICE_ROLE_KEY }}
           # Stage and per-PR previews share a Postgres password (the per-PR
           # web container connects directly to stage-${APP_NAME}-db over
           # `pr-shared` for Drizzle / postgres-js queries that bypass kong).
-          POSTGRES_PASSWORD: ${{ secrets.PREVIEW_POSTGRES_PASSWORD }}
-          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
-          RESEND_API_TOKEN: ${{ secrets.RESEND_API_TOKEN }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ env.NEXT_PUBLIC_SENTRY_DSN }}
+          RESEND_API_TOKEN: ${{ env.RESEND_API_TOKEN }}
         run: |
           set -euo pipefail
           for f in preview/compose.template.yml preview/.env.template; do
