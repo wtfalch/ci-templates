@@ -152,10 +152,17 @@ jobs:
           srv=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' /tmp/sops.env | cut -d= -f2-)
           dsn=$(grep '^NEXT_PUBLIC_SENTRY_DSN=' /tmp/sops.env | cut -d= -f2-)
           resend=$(grep '^RESEND_API_KEY=' /tmp/sops.env | cut -d= -f2-)
+          # Bridge keys are OPTIONAL — only apps with a Claude-bridge-style
+          # daemon (e.g. lokessmie) declare them. Apps that don't leave them
+          # absent from SOPS and the stage .env template doesn't reference
+          # them, so envsubst is a no-op for those apps.
+          bridge_url=$(grep '^BRIDGE_URL=' /tmp/sops.env | cut -d= -f2- || true)
+          bridge_secret=$(grep '^BRIDGE_WEBHOOK_SECRET=' /tmp/sops.env | cut -d= -f2- || true)
+          app_webhook=$(grep '^APP_WEBHOOK_URL=' /tmp/sops.env | cut -d= -f2- || true)
           for v in "$pg_pass" "$jwt" "$anon" "$srv"; do
             [ -z "$v" ] && { echo "::error::missing required secret in SOPS file"; exit 1; }
           done
-          for v in "$pg_pass" "$jwt" "$anon" "$srv" "$dsn" "$resend"; do
+          for v in "$pg_pass" "$jwt" "$anon" "$srv" "$dsn" "$resend" "$bridge_url" "$bridge_secret" "$app_webhook"; do
             [ -n "$v" ] && echo "::add-mask::${v}"
           done
           {
@@ -165,6 +172,9 @@ jobs:
             echo "SERVICE_ROLE_KEY=${srv}"
             echo "NEXT_PUBLIC_SENTRY_DSN=${dsn}"
             echo "RESEND_API_TOKEN=${resend}"
+            echo "BRIDGE_URL=${bridge_url}"
+            echo "BRIDGE_WEBHOOK_SECRET=${bridge_secret}"
+            echo "APP_WEBHOOK_URL=${app_webhook}"
           } >> "$GITHUB_ENV"
           rm /tmp/sops.env
 
@@ -179,6 +189,9 @@ jobs:
           SERVICE_ROLE_KEY: ${{ env.SERVICE_ROLE_KEY }}
           NEXT_PUBLIC_SENTRY_DSN: ${{ env.NEXT_PUBLIC_SENTRY_DSN }}
           RESEND_API_TOKEN: ${{ env.RESEND_API_TOKEN }}
+          BRIDGE_URL: ${{ env.BRIDGE_URL }}
+          BRIDGE_WEBHOOK_SECRET: ${{ env.BRIDGE_WEBHOOK_SECRET }}
+          APP_WEBHOOK_URL: ${{ env.APP_WEBHOOK_URL }}
         run: |
           set -euo pipefail
           for f in stage/compose.template.yml stage/.env.template stage/kong.template.yml; do
@@ -188,7 +201,7 @@ jobs:
             fi
           done
           mkdir -p rendered
-          VARS='$APP_NAME $APP_DOMAIN $GHCR_OWNER $POSTGRES_PASSWORD $JWT_SECRET $ANON_KEY $SERVICE_ROLE_KEY $NEXT_PUBLIC_SENTRY_DSN $RESEND_API_TOKEN'
+          VARS='$APP_NAME $APP_DOMAIN $GHCR_OWNER $POSTGRES_PASSWORD $JWT_SECRET $ANON_KEY $SERVICE_ROLE_KEY $NEXT_PUBLIC_SENTRY_DSN $RESEND_API_TOKEN $BRIDGE_URL $BRIDGE_WEBHOOK_SECRET $APP_WEBHOOK_URL'
           envsubst "$VARS" < stage/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < stage/.env.template        > rendered/.env
           envsubst "$VARS" < stage/kong.template.yml    > rendered/kong.yml

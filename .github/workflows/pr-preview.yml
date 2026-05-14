@@ -160,10 +160,15 @@ jobs:
           srv=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' /tmp/sops.env | cut -d= -f2-)
           dsn=$(grep '^NEXT_PUBLIC_SENTRY_DSN=' /tmp/sops.env | cut -d= -f2-)
           resend=$(grep '^RESEND_API_KEY=' /tmp/sops.env | cut -d= -f2-)
+          # BRIDGE_URL is OPTIONAL — only apps with a Claude-bridge-style
+          # daemon (e.g. lokessmie) set it. Apps without one leave the key
+          # absent from SOPS and the preview .env template; envsubst leaves
+          # the unreferenced variable alone.
+          bridge_url=$(grep '^BRIDGE_URL=' /tmp/sops.env | cut -d= -f2- || true)
           for v in "$pg_pass" "$anon" "$srv"; do
             [ -z "$v" ] && { echo "::error::missing required secret in SOPS file"; exit 1; }
           done
-          for v in "$pg_pass" "$anon" "$srv" "$dsn" "$resend"; do
+          for v in "$pg_pass" "$anon" "$srv" "$dsn" "$resend" "$bridge_url"; do
             [ -n "$v" ] && echo "::add-mask::${v}"
           done
           {
@@ -172,6 +177,7 @@ jobs:
             echo "SERVICE_ROLE_KEY=${srv}"
             echo "NEXT_PUBLIC_SENTRY_DSN=${dsn}"
             echo "RESEND_API_TOKEN=${resend}"
+            echo "BRIDGE_URL=${bridge_url}"
           } >> "$GITHUB_ENV"
           rm /tmp/sops.env
 
@@ -189,6 +195,7 @@ jobs:
           POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
           NEXT_PUBLIC_SENTRY_DSN: ${{ env.NEXT_PUBLIC_SENTRY_DSN }}
           RESEND_API_TOKEN: ${{ env.RESEND_API_TOKEN }}
+          BRIDGE_URL: ${{ env.BRIDGE_URL }}
         run: |
           set -euo pipefail
           for f in preview/compose.template.yml preview/.env.template; do
@@ -201,7 +208,7 @@ jobs:
           # Per-PR previews share stage's supabase stack. POSTGRES_PASSWORD is
           # threaded so DATABASE_URL in preview/.env can hit stage's db
           # directly. JWT_SECRET stays per-stage-only.
-          VARS='$PR_NUMBER $APP_NAME $APP_DOMAIN $GHCR_OWNER $ANON_KEY $SERVICE_ROLE_KEY $POSTGRES_PASSWORD $NEXT_PUBLIC_SENTRY_DSN $RESEND_API_TOKEN'
+          VARS='$PR_NUMBER $APP_NAME $APP_DOMAIN $GHCR_OWNER $ANON_KEY $SERVICE_ROLE_KEY $POSTGRES_PASSWORD $NEXT_PUBLIC_SENTRY_DSN $RESEND_API_TOKEN $BRIDGE_URL'
           envsubst "$VARS" < preview/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < preview/.env.template        > rendered/.env
 
