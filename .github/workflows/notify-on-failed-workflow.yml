@@ -1,0 +1,84 @@
+name: Notify on failed workflow
+
+# Reusable handler for the "a monitored workflow failed on main" case.
+# The caller wires the `workflow_run` trigger that names which workflow(s)
+# to monitor (the `workflows:` filter MUST be in the caller's file, not
+# here, because GitHub resolves it relative to the file that declares the
+# trigger).
+#
+# This reusable runs the side effects: opens a GitHub issue and (if
+# SLACK_WEBHOOK_URL is set) posts a Slack message. The caller passes
+# `secrets: inherit` so SLACK_WEBHOOK_URL flows through automatically;
+# the issue-create uses the default GITHUB_TOKEN.
+#
+# Caller shape (in apps that monitor their own deploys):
+#   on:
+#     workflow_run:
+#       workflows: ["Build, push, deploy"]
+#       types: [completed]
+#       branches: [main]
+#   jobs:
+#     notify:
+#       if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure' }}
+#       uses: wtfalch/ci-templates/.github/workflows/notify-on-failed-workflow.yml@main
+#       secrets: inherit
+
+on:
+  workflow_call:
+    secrets:
+      SLACK_WEBHOOK_URL:
+        description: Slack incoming webhook URL. Optional — omit to skip Slack posts.
+        required: false
+
+jobs:
+  open-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            if (!run) {
+              core.setFailed('expected a workflow_run payload — this reusable must be called from a workflow_run trigger');
+              return;
+            }
+            const subject = (run.head_commit?.message ?? '').split('\n')[0] || '(no commit message)';
+            const sha7 = run.head_sha.slice(0, 7);
+            const title = `${run.name} failed on ${run.head_branch} @ ${sha7}: ${subject}`;
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: [
+                `**Workflow:** ${run.name}`,
+                `**Run:** ${run.html_url}`,
+                `**Branch:** ${run.head_branch}`,
+                `**Triggered by:** ${run.actor?.login ?? 'unknown'}`,
+                `**Commit:** \`${sha7}\` — ${subject}`,
+                ``,
+                `Auto-opened by the \`notify-on-failed-workflow\` reusable in wtfalch/ci-templates. Close once the underlying failure is fixed (or the run is re-run green).`,
+              ].join('\n'),
+            });
+
+            const webhook = process.env.SLACK_WEBHOOK_URL;
+            if (webhook) {
+              const text = [
+                `*[error] ${run.name} failed* on \`${run.head_branch}\` @ \`${sha7}\``,
+                subject,
+                `By: ${run.actor?.login ?? 'unknown'}`,
+                `<${run.html_url}|workflow run> · <${issue.data.html_url}|issue #${issue.data.number}>`,
+              ].join('\n');
+              const resp = await fetch(webhook, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text }),
+              });
+              if (!resp.ok) {
+                core.warning(`Slack POST failed: ${resp.status} ${await resp.text()}`);
+              }
+            }
