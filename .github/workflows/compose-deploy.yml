@@ -18,8 +18,14 @@ name: Compose deploy
 #      reconciles. Compose recreates only services whose image / env /
 #      networks / labels changed; the rest stay running.
 #
-# Out of scope: building images (deploy.yml does that), running migrations,
-# editing .env (which has secrets that don't belong in the repo).
+# Out of scope: building images (deploy.yml does that), running migrations.
+#
+# .env handling (was previously out of scope): if the caller passes
+# `sops-prod-env-file`, the workflow decrypts that sops file and ships
+# the rendered .env alongside docker-compose.yml in the same atomic
+# swap. Without that input, .env on the LXC stays operator-managed
+# (the original behavior — keep this default for repos that haven't
+# adopted sops for prod yet).
 
 on:
   workflow_call:
@@ -36,6 +42,17 @@ on:
         type: string
         required: false
         default: ''
+      sops-prod-env-file:
+        description: |
+          Optional: path in the caller repo to a sops-encrypted dotenv
+          file. When set, the workflow decrypts it and writes the
+          result to /opt/stack/{app}/.env on the LXC as part of the
+          same atomic swap as docker-compose.yml. Requires the
+          SOPS_AGE_KEY secret to be passed too. When unset, the
+          existing .env on the LXC is untouched.
+        type: string
+        required: false
+        default: ''
     secrets:
       DEPLOY_SSH_KEY:
         required: true
@@ -47,6 +64,11 @@ on:
         required: true
       CF_ACCESS_CLIENT_SECRET:
         required: true
+      SOPS_AGE_KEY:
+        required: false
+        description: |
+          age private key for decrypting sops-prod-env-file. Required
+          only if that input is set; ignored otherwise.
 
 permissions:
   contents: read
@@ -71,6 +93,19 @@ jobs:
           fi
           echo "compose file size: $(wc -c < docker-compose.yml) bytes"
 
+      # Optional: decrypt the prod sops env file so it ships alongside
+      # the compose file in the same atomic swap below. Skipped when the
+      # caller didn't pass the input (back-compat for apps that still
+      # operator-manage their .env on the LXC).
+      - name: Decrypt sops prod env (optional)
+        if: inputs.sops-prod-env-file != ''
+        uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
+        with:
+          env-file: ${{ inputs.sops-prod-env-file }}
+          output-file: /tmp/render.env
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+
       - name: Install cloudflared
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
@@ -91,22 +126,40 @@ jobs:
           SSH_USER: ${{ secrets.DEPLOY_USER }}
           APP_NAME: ${{ inputs.app-name }}
           SERVICE: ${{ inputs.service }}
+          SHIP_ENV: ${{ inputs.sops-prod-env-file != '' && '1' || '' }}
         run: |
           set -euo pipefail
           STACK_DIR="/opt/stack/${APP_NAME}"
 
-          # Pipe the compose file as a tar to ssh's stdin. The whole remote
+          # Build the tar payload. Always includes docker-compose.yml.
+          # When SHIP_ENV is set (caller provided sops-prod-env-file),
+          # the decrypted .env from /tmp/render.env is bundled alongside
+          # under the name `prod.env.new` so the remote can swap it in
+          # atomically with the compose file. Keeping the file naming
+          # explicit (`prod.env.new`) avoids confusing a partially-
+          # transferred tar with the live `.env`.
+          if [ -n "${SHIP_ENV}" ]; then
+            cp /tmp/render.env prod.env.new
+            chmod 600 prod.env.new
+            TAR_PAYLOAD="docker-compose.yml prod.env.new"
+          else
+            TAR_PAYLOAD="docker-compose.yml"
+          fi
+
+          # Pipe the bundle as a tar to ssh's stdin. The whole remote
           # script is passed as ssh's command argument (NOT via `bash -s`
           # heredoc, which would consume stdin and leave nothing for the
           # remote `tar -xf -`). Variables are interpolated locally; the
           # script itself uses single-quotes wherever possible to keep
           # remote-shell escaping minimal.
           #
-          # Validation: `docker compose config -q` against the live .env
-          # catches yaml syntax errors and env-interpolation problems.
-          # Atomic swap via mv only happens after validation passes; on any
-          # failure before the swap, the live compose is untouched.
-          tar -cf - docker-compose.yml | \
+          # Validation: `docker compose config -q` against the NEW .env
+          # (if one is being shipped) or the LIVE .env (when keeping the
+          # operator-managed file). Atomic swap via mv only happens after
+          # validation passes; on any failure before the swap, the live
+          # files are untouched.
+          # shellcheck disable=SC2086
+          tar -cf - ${TAR_PAYLOAD} | \
           ssh -i ~/.ssh/id_ed25519 \
               -o StrictHostKeyChecking=no \
               -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
@@ -116,11 +169,18 @@ jobs:
                rm -rf .compose-deploy-tmp
                mkdir -p .compose-deploy-tmp
                tar -xf - -C .compose-deploy-tmp
+               # Pick the env file the new compose should validate against:
+               # the new sops-rendered one when present, otherwise the
+               # live .env (back-compat for callers without sops env sync).
+               VALIDATE_ENV_FILE='.env'
+               if [ -f .compose-deploy-tmp/prod.env.new ]; then
+                 VALIDATE_ENV_FILE='.compose-deploy-tmp/prod.env.new'
+               fi
                # --project-directory . tells compose to resolve --env-file
-               # relative to cwd (where the live .env lives) rather than
-               # the compose file's parent dir (the tmpdir, where it doesn't).
-               if ! docker compose -f .compose-deploy-tmp/docker-compose.yml --project-directory . --env-file .env config -q; then
-                 echo '::error::compose validation failed; live compose left in place'
+               # relative to cwd, then we override with --env-file pointing
+               # at whichever file actually carries the variables.
+               if ! docker compose -f .compose-deploy-tmp/docker-compose.yml --project-directory . --env-file \"\$VALIDATE_ENV_FILE\" config -q; then
+                 echo '::error::compose validation failed; live files left in place'
                  rm -rf .compose-deploy-tmp
                  exit 1
                fi
@@ -128,11 +188,18 @@ jobs:
                # deploy user may not own it (manual edits in incidents are
                # often done as root, leaving root-owned .bak files behind);
                # rm only needs write on the parent dir, which deploy has.
-               # The .bak file is the one-line rollback handle:
-               #   ssh root@lxc 'cd /opt/stack/{app}; cp docker-compose.yml.bak docker-compose.yml && docker compose up -d --remove-orphans'
+               # The .bak files are the one-line rollback handle:
+               #   ssh root@lxc 'cd /opt/stack/{app}; cp docker-compose.yml.bak docker-compose.yml; cp .env.bak .env; docker compose up -d --remove-orphans'
                rm -f docker-compose.yml.bak
                cp docker-compose.yml docker-compose.yml.bak
                mv .compose-deploy-tmp/docker-compose.yml docker-compose.yml
+               if [ -f .compose-deploy-tmp/prod.env.new ]; then
+                 rm -f .env.bak
+                 # Some apps don't have a live .env yet on first sync.
+                 [ -f .env ] && cp .env .env.bak
+                 mv .compose-deploy-tmp/prod.env.new .env
+                 chmod 600 .env
+               fi
                rmdir .compose-deploy-tmp
                # Apply. Compose figures out which services actually changed
                # (image / labels / env / networks / volumes) and recreates
@@ -143,5 +210,10 @@ jobs:
                  docker compose up -d --remove-orphans
                fi
                docker compose ps --format 'table {{.Name}}\t{{.Status}}'"
+
+          # Defense in depth: shred the local copy if it landed (the runner
+          # is ephemeral, but no reason to leave it sitting in the workspace).
+          [ -f prod.env.new ] && shred -u prod.env.new 2>/dev/null || rm -f prod.env.new
+          [ -f /tmp/render.env ] && shred -u /tmp/render.env 2>/dev/null || rm -f /tmp/render.env
 
           echo "::notice::compose deploy applied for ${APP_NAME}"
