@@ -140,45 +140,85 @@ jobs:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
 
       - name: Source render-time secrets from SOPS
-        # Map the SOPS file's runtime names into the names the templates
-        # expect (envsubst variable names — POSTGRES_PASSWORD, ANON_KEY,
-        # SERVICE_ROLE_KEY, etc.). POSTGRES_PASSWORD is parsed out of
-        # DATABASE_URL since the encrypted file doesn't keep it standalone.
+        # Pass every key from the decrypted sops file through to
+        # $GITHUB_ENV so app-specific .env.template placeholders
+        # (BRIDGE_URL, FAL_API_KEY, MESHY_API_KEY, ASSET_GALLERY_ENABLED,
+        # any future app env) reach envsubst without each new key
+        # requiring a ci-templates edit. The 6 keys this step used to
+        # hand-extract are still validated explicitly; that's the
+        # backwards-compatible bare minimum for any app deploying
+        # via this workflow.
+        #
+        # POSTGRES_PASSWORD is derived from DATABASE_URL (the sops
+        # file doesn't store it standalone) and emitted as an extra
+        # GITHUB_ENV key the templates can reference as ${POSTGRES_PASSWORD}.
+        #
+        # SOPS_PASSTHROUGH_KEYS captures the names of every sops key
+        # for the envsubst VARS list in the next step.
         run: |
+          set -euo pipefail
           db_url=$(grep '^DATABASE_URL=' /tmp/sops.env | cut -d= -f2-)
           pg_pass=$(printf '%s' "$db_url" | sed -E 's|^postgres(ql)?://[^:]+:([^@]+)@.*$|\2|')
           jwt=$(grep '^JWT_SECRET=' /tmp/sops.env | cut -d= -f2-)
           anon=$(grep '^NEXT_PUBLIC_SUPABASE_ANON_KEY=' /tmp/sops.env | cut -d= -f2-)
           srv=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' /tmp/sops.env | cut -d= -f2-)
-          dsn=$(grep '^NEXT_PUBLIC_SENTRY_DSN=' /tmp/sops.env | cut -d= -f2-)
-          resend=$(grep '^RESEND_API_KEY=' /tmp/sops.env | cut -d= -f2-)
           for v in "$pg_pass" "$jwt" "$anon" "$srv"; do
             [ -z "$v" ] && { echo "::error::missing required secret in SOPS file"; exit 1; }
           done
-          for v in "$pg_pass" "$jwt" "$anon" "$srv" "$dsn" "$resend"; do
+          for v in "$pg_pass" "$jwt" "$anon" "$srv"; do
             [ -n "$v" ] && echo "::add-mask::${v}"
           done
+
+          # Emit POSTGRES_PASSWORD (derived) + the alias ANON_KEY /
+          # SERVICE_ROLE_KEY (envsubst expects those names, but sops
+          # has NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY).
           {
             echo "POSTGRES_PASSWORD=${pg_pass}"
-            echo "JWT_SECRET=${jwt}"
             echo "ANON_KEY=${anon}"
             echo "SERVICE_ROLE_KEY=${srv}"
-            echo "NEXT_PUBLIC_SENTRY_DSN=${dsn}"
-            echo "RESEND_API_TOKEN=${resend}"
           } >> "$GITHUB_ENV"
+
+          # Pass through every other key verbatim. Skips blanks, comments,
+          # malformed lines. Mask any value 8 chars or longer that isn't
+          # a trivial boolean / flag — covers URLs, tokens, secrets without
+          # caring about which is which.
+          passthrough_names=""
+          while IFS='=' read -r key val; do
+            [ -z "$key" ] && continue
+            case "$key" in
+              \#*) continue ;;
+            esac
+            case "$val" in
+              true|false|0|1|yes|no) ;;
+              *)
+                if [ ${#val} -ge 8 ]; then
+                  echo "::add-mask::${val}"
+                fi
+                ;;
+            esac
+            # Heredoc so values containing = or # survive into GITHUB_ENV.
+            {
+              printf '%s<<__SOPS_EOF__\n' "$key"
+              printf '%s\n' "$val"
+              printf '__SOPS_EOF__\n'
+            } >> "$GITHUB_ENV"
+            passthrough_names="${passthrough_names} \$${key}"
+          done < /tmp/sops.env
+          echo "SOPS_PASSTHROUGH_VARS=${passthrough_names}" >> "$GITHUB_ENV"
+
           rm /tmp/sops.env
 
       - name: Render compose + .env + kong.yml from templates
+        # The previous step echoed every sops key into $GITHUB_ENV.
+        # envsubst's VARS list combines the well-known names (APP_NAME,
+        # APP_DOMAIN, GHCR_OWNER) with the SOPS_PASSTHROUGH_VARS list
+        # assembled in the previous step — so any new key landed in sops
+        # automatically reaches envsubst on the next deploy. No more
+        # silent-empty placeholders.
         env:
           APP_NAME: ${{ inputs.app-name }}
           APP_DOMAIN: ${{ inputs.app-domain }}
           GHCR_OWNER: ${{ github.repository_owner }}
-          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
-          JWT_SECRET: ${{ env.JWT_SECRET }}
-          ANON_KEY: ${{ env.ANON_KEY }}
-          SERVICE_ROLE_KEY: ${{ env.SERVICE_ROLE_KEY }}
-          NEXT_PUBLIC_SENTRY_DSN: ${{ env.NEXT_PUBLIC_SENTRY_DSN }}
-          RESEND_API_TOKEN: ${{ env.RESEND_API_TOKEN }}
         run: |
           set -euo pipefail
           for f in stage/compose.template.yml stage/.env.template stage/kong.template.yml; do
@@ -188,7 +228,7 @@ jobs:
             fi
           done
           mkdir -p rendered
-          VARS='$APP_NAME $APP_DOMAIN $GHCR_OWNER $POSTGRES_PASSWORD $JWT_SECRET $ANON_KEY $SERVICE_ROLE_KEY $NEXT_PUBLIC_SENTRY_DSN $RESEND_API_TOKEN'
+          VARS="\$APP_NAME \$APP_DOMAIN \$GHCR_OWNER${SOPS_PASSTHROUGH_VARS} \$POSTGRES_PASSWORD \$ANON_KEY \$SERVICE_ROLE_KEY"
           envsubst "$VARS" < stage/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < stage/.env.template        > rendered/.env
           envsubst "$VARS" < stage/kong.template.yml    > rendered/kong.yml

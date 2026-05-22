@@ -153,42 +153,65 @@ jobs:
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
 
       - name: Source render-time secrets from SOPS
+        # Same pass-through-all-keys design as stage-deploy.yml — every
+        # sops key reaches the envsubst step automatically so .env.template
+        # placeholders don't silently render empty when the caller repo
+        # adds a new sops key.
         run: |
+          set -euo pipefail
           db_url=$(grep '^DATABASE_URL=' /tmp/sops.env | cut -d= -f2-)
           pg_pass=$(printf '%s' "$db_url" | sed -E 's|^postgres(ql)?://[^:]+:([^@]+)@.*$|\2|')
           anon=$(grep '^NEXT_PUBLIC_SUPABASE_ANON_KEY=' /tmp/sops.env | cut -d= -f2-)
           srv=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' /tmp/sops.env | cut -d= -f2-)
-          dsn=$(grep '^NEXT_PUBLIC_SENTRY_DSN=' /tmp/sops.env | cut -d= -f2-)
-          resend=$(grep '^RESEND_API_KEY=' /tmp/sops.env | cut -d= -f2-)
           for v in "$pg_pass" "$anon" "$srv"; do
             [ -z "$v" ] && { echo "::error::missing required secret in SOPS file"; exit 1; }
           done
-          for v in "$pg_pass" "$anon" "$srv" "$dsn" "$resend"; do
+          for v in "$pg_pass" "$anon" "$srv"; do
             [ -n "$v" ] && echo "::add-mask::${v}"
           done
+
           {
             echo "POSTGRES_PASSWORD=${pg_pass}"
             echo "ANON_KEY=${anon}"
             echo "SERVICE_ROLE_KEY=${srv}"
-            echo "NEXT_PUBLIC_SENTRY_DSN=${dsn}"
-            echo "RESEND_API_TOKEN=${resend}"
           } >> "$GITHUB_ENV"
+
+          passthrough_names=""
+          while IFS='=' read -r key val; do
+            [ -z "$key" ] && continue
+            case "$key" in
+              \#*) continue ;;
+            esac
+            case "$val" in
+              true|false|0|1|yes|no) ;;
+              *)
+                if [ ${#val} -ge 8 ]; then
+                  echo "::add-mask::${val}"
+                fi
+                ;;
+            esac
+            {
+              printf '%s<<__SOPS_EOF__\n' "$key"
+              printf '%s\n' "$val"
+              printf '__SOPS_EOF__\n'
+            } >> "$GITHUB_ENV"
+            passthrough_names="${passthrough_names} \$${key}"
+          done < /tmp/sops.env
+          echo "SOPS_PASSTHROUGH_VARS=${passthrough_names}" >> "$GITHUB_ENV"
+
           rm /tmp/sops.env
 
       - name: Render compose + .env from templates
+        # The previous step echoed every sops key into $GITHUB_ENV. VARS
+        # combines the well-known names (PR_NUMBER, APP_NAME, APP_DOMAIN,
+        # GHCR_OWNER) with the auto-built SOPS_PASSTHROUGH_VARS list so
+        # any new sops key reaches envsubst without needing a
+        # ci-templates edit.
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           APP_NAME: ${{ inputs.app-name }}
           APP_DOMAIN: ${{ inputs.app-domain }}
           GHCR_OWNER: ${{ github.repository_owner }}
-          ANON_KEY: ${{ env.ANON_KEY }}
-          SERVICE_ROLE_KEY: ${{ env.SERVICE_ROLE_KEY }}
-          # Stage and per-PR previews share a Postgres password (the per-PR
-          # web container connects directly to stage-${APP_NAME}-db over
-          # `pr-shared` for Drizzle / postgres-js queries that bypass kong).
-          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
-          NEXT_PUBLIC_SENTRY_DSN: ${{ env.NEXT_PUBLIC_SENTRY_DSN }}
-          RESEND_API_TOKEN: ${{ env.RESEND_API_TOKEN }}
         run: |
           set -euo pipefail
           for f in preview/compose.template.yml preview/.env.template; do
@@ -198,10 +221,7 @@ jobs:
             fi
           done
           mkdir -p rendered
-          # Per-PR previews share stage's supabase stack. POSTGRES_PASSWORD is
-          # threaded so DATABASE_URL in preview/.env can hit stage's db
-          # directly. JWT_SECRET stays per-stage-only.
-          VARS='$PR_NUMBER $APP_NAME $APP_DOMAIN $GHCR_OWNER $ANON_KEY $SERVICE_ROLE_KEY $POSTGRES_PASSWORD $NEXT_PUBLIC_SENTRY_DSN $RESEND_API_TOKEN'
+          VARS="\$PR_NUMBER \$APP_NAME \$APP_DOMAIN \$GHCR_OWNER${SOPS_PASSTHROUGH_VARS} \$POSTGRES_PASSWORD \$ANON_KEY \$SERVICE_ROLE_KEY"
           envsubst "$VARS" < preview/compose.template.yml > rendered/compose.yml
           envsubst "$VARS" < preview/.env.template        > rendered/.env
 
