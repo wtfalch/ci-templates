@@ -128,12 +128,15 @@ jobs:
           USER: ${{ secrets.DEPLOY_USER }}
           PATH_ON_HOST: ${{ secrets.DEPLOY_PATH }}
           SERVICE: ${{ inputs.service-name }}
+          # Per-deploy GHCR login — see stage-deploy.yml for the rationale.
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           ssh -i ~/.ssh/id_ed25519 \
             -o StrictHostKeyChecking=no \
             -o ProxyCommand="cloudflared access ssh --hostname %h --id $CF_ID --secret $CF_SECRET" \
             "${USER}@${HOST}" \
-            "cd ${PATH_ON_HOST} && docker compose pull ${SERVICE} && docker compose up -d --no-deps ${SERVICE} && docker image prune -f"
+            "printf %s '${GHCR_TOKEN}' | docker login ghcr.io -u '${GHCR_USER}' --password-stdin >/dev/null && cd ${PATH_ON_HOST} && docker compose pull ${SERVICE} && docker compose up -d --no-deps ${SERVICE} && docker image prune -f"
 
       - name: Purge Cloudflare cache
         if: ${{ inputs.cloudflare-zone-id != '' }}
