@@ -245,6 +245,11 @@ jobs:
           SSH_USER: ${{ secrets.DEPLOY_USER }}
           APP_NAME: ${{ inputs.app-name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Per-deploy GHCR login — see stage-deploy.yml for the rationale
+          # (the host's baked-in PAT expired June 2026; ephemeral tokens
+          # can't rot).
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           PREVIEW_DIR="/opt/previews/${APP_NAME}/pr-${PR_NUMBER}"
@@ -261,6 +266,7 @@ jobs:
              tar -C '${PREVIEW_DIR}' -xf -; \
              chmod 600 '${PREVIEW_DIR}/.env'; \
              cd '${PREVIEW_DIR}'; \
+             printf %s '${GHCR_TOKEN}' | docker login ghcr.io -u '${GHCR_USER}' --password-stdin >/dev/null; \
              docker compose -p 'pr-${PR_NUMBER}' down -v --remove-orphans 2>/dev/null || true; \
              docker compose -p 'pr-${PR_NUMBER}' pull --quiet; \
              docker compose -p 'pr-${PR_NUMBER}' up -d --wait --wait-timeout 240; \

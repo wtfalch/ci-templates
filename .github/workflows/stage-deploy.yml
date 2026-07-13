@@ -255,6 +255,13 @@ jobs:
           HOST: ${{ secrets.DEPLOY_HOST }}
           SSH_USER: ${{ secrets.DEPLOY_USER }}
           APP_NAME: ${{ inputs.app-name }}
+          # Remote GHCR login with the run's ephemeral token. The LXC used
+          # to rely on a long-lived PAT baked into ~/.docker/config.json —
+          # it expired in June 2026 and every pull started failing with
+          # `error from registry: denied`. Logging in per-deploy means
+          # there is no credential to rot.
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           STAGE_DIR="/opt/stage/${APP_NAME}"
@@ -274,6 +281,7 @@ jobs:
              tar -C '${STAGE_DIR}' -xf -; \
              chmod 600 '${STAGE_DIR}/.env'; \
              cd '${STAGE_DIR}'; \
+             printf %s '${GHCR_TOKEN}' | docker login ghcr.io -u '${GHCR_USER}' --password-stdin >/dev/null; \
              docker compose -p 'stage-${APP_NAME}' pull --quiet; \
              docker compose -p 'stage-${APP_NAME}' up -d --wait --wait-timeout 240; \
              docker image prune -f"
@@ -286,6 +294,8 @@ jobs:
           SSH_USER: ${{ secrets.DEPLOY_USER }}
           APP_NAME: ${{ inputs.app-name }}
           GHCR_OWNER: ${{ github.repository_owner }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           # Run the :stage-migrate image against stage's db. The migrate
           # container's DATABASE_URL inside the stage stack already points at
@@ -303,7 +313,8 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o ProxyCommand="cloudflared access ssh --hostname %h --id ${CF_ID} --secret ${CF_SECRET}" \
             "${SSH_USER}@${HOST}" \
-            "cd /opt/stage/${APP_NAME} && \
+            "printf %s '${GHCR_TOKEN}' | docker login ghcr.io -u '${GHCR_USER}' --password-stdin >/dev/null && \
+             cd /opt/stage/${APP_NAME} && \
              docker pull 'ghcr.io/${GHCR_OWNER}/${APP_NAME}:stage-migrate' && \
              docker run --rm \
                --network stage-${APP_NAME}_default \
