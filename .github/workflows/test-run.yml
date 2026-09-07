@@ -186,9 +186,18 @@ jobs:
           # `timeout` around docker, not docker's own --stop-timeout, which
           # only says how long to wait after asking a container to stop and
           # would let a hung job run until the runner's own limit.
+          # As the host's user, not the image's. The workspace is a checkout
+          # owned by the runner (uid 1001 on GitHub's images) and the lane
+          # image's own user is uid 1000, so the container writes nothing —
+          # `pnpm install` fails on permissions before a single test runs.
+          # HOME comes with it, because that user does not exist in the
+          # container's passwd and tools that want a home directory otherwise
+          # get `/` and fail in less obvious ways.
           timeout --signal=TERM --kill-after=30 "$timeout" \
             docker run --rm \
               --network assay-net \
+              --user "$(id -u):$(id -g)" \
+              -e HOME=/tmp \
               --env-file /tmp/job.env \
               -v "$PWD:/workspace" \
               -v /tmp/job.sh:/tmp/job.sh:ro \
