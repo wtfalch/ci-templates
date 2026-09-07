@@ -1,0 +1,240 @@
+name: assay test run
+
+# Runs a repository's `.assay.yml`: validate it, expand its matrix, and run each
+# job inside the lane image the manifest asked for.
+#
+# The workflow deliberately knows almost nothing. It does not know what a lane
+# is, how a matrix expands, or how `${{ matrix.x }}` is substituted — it asks
+# the `assay` CLI, which ships inside a published image. Every rule that lives
+# in YAML is a rule that has to be reimplemented when the same manifest runs
+# somewhere that is not GitHub Actions, and reimplemented rules drift.
+#
+# Usage, in a calling repository:
+#
+#   jobs:
+#     e2e:
+#       uses: wtfalch/ci-templates/.github/workflows/test-run.yml@main
+#       secrets: inherit
+#
+# `secrets: inherit` only matters if the manifest declares any under `secrets:`;
+# a manifest that declares none needs no secrets line at all.
+
+on:
+  workflow_call:
+    inputs:
+      manifest:
+        description: Path to the manifest, relative to the repository root.
+        type: string
+        default: .assay.yml
+      cli-image:
+        description: >-
+          The image holding the assay CLI. Pin this to a digest in anything
+          that matters; `latest` is a convenience, not a guarantee.
+        type: string
+        default: ghcr.io/wtfalch/assay-cli:latest
+      lane-image-prefix:
+        description: Lane images are "<prefix><lane>", by convention.
+        type: string
+        default: ghcr.io/wtfalch/assay-
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # Validate once, before any lane image is pulled. A manifest with a bad path
+  # or a leaked credential should cost seconds, not the two minutes it takes to
+  # fetch three browser engines.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      jobs: ${{ steps.expand.outputs.jobs }}
+      lane: ${{ steps.expand.outputs.lane }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: is this manifest runnable
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
+            validate "${{ inputs.manifest }}"
+
+      - id: expand
+        name: what does it expand to
+        run: |
+          set -euo pipefail
+          jobs="$(docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
+            expand "${{ inputs.manifest }}")"
+          lane="$(docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
+            resolve "${{ inputs.manifest }}" | jq -r .lane)"
+          printf 'jobs=%s\n' "$jobs" >> "$GITHUB_OUTPUT"
+          printf 'lane=%s\n' "$lane" >> "$GITHUB_OUTPUT"
+          printf '%s on lane %s\n' "$(printf '%s' "$jobs" | jq length) job(s)" "$lane" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  run:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      # One combination failing must not cancel the others. A matrix where
+      # webkit fails and chromium passes is a result worth having; three
+      # cancelled jobs is a re-run.
+      fail-fast: false
+      matrix:
+        combination: ${{ fromJSON(needs.plan.outputs.jobs) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The resolved job: the command with `${{ matrix.x }}` already
+      # substituted, and the service list, timeouts and result paths beside it.
+      # Written to a file rather than an output so nothing passes through
+      # GitHub's own `${{ }}` interpolation — a manifest command legitimately
+      # contains that syntax, and Actions would eat it.
+      - name: resolve this combination
+        env:
+          COMBINATION: ${{ toJSON(matrix.combination) }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
+            resolve "${{ inputs.manifest }}" "$COMBINATION" > /tmp/job.json
+          jq -r '"lane=\(.lane)  timeout=\(.timeout)s"' /tmp/job.json
+
+      # Secrets arrive wholesale through `secrets: inherit` and are filtered
+      # here down to the names the manifest declares. That is safe because the
+      # caller and the secrets are the same repository — the paid tier resolves
+      # from a per-tenant vault instead, and never inherits anything.
+      #
+      # Written to a file with restrictive permissions rather than passed as
+      # `-e NAME=value`, which would put every value in the process list.
+      - name: collect the declared secrets
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : > /tmp/job.env
+          for name in $(jq -r '.secrets[]' /tmp/job.json); do
+            value="$(printf '%s' "$ALL_SECRETS" | jq -r --arg n "$name" '.[$n] // empty')"
+            if [ -z "$value" ]; then
+              printf '::error::the manifest declares secret %s and the caller did not provide it\n' "$name"
+              exit 1
+            fi
+            printf '%s=%s\n' "$name" "$value" >> /tmp/job.env
+          done
+          jq -r '.env | to_entries[] | "\(.key)=\(.value)"' /tmp/job.json >> /tmp/job.env
+          printf 'CI=true\n' >> /tmp/job.env
+
+      # Services on a user-defined network, started the same way the
+      # self-hosted executor will start them. GitHub's own `services:` block
+      # cannot be used: it is static YAML, and this list comes from a file that
+      # does not exist until the job is running.
+      - name: start the services
+        run: |
+          set -euo pipefail
+          docker network create assay-net >/dev/null
+          jq -c '.services[]' /tmp/job.json | while read -r service; do
+            image="$(printf '%s' "$service" | jq -r .image)"
+            alias="$(printf '%s' "$image" | sed 's|.*/||; s|[:@].*||')"
+            # An array, not a string: a value with a space in it splits into
+            # two arguments otherwise, and the failure looks like a bad image.
+            args=()
+            while IFS= read -r pair; do args+=(-e "$pair"); done < <(
+              printf '%s' "$service" | jq -r '.env | to_entries[] | "\(.key)=\(.value)"'
+            )
+            docker run -d --rm --name "$alias" --network assay-net --network-alias "$alias" \
+              "${args[@]}" "$image" >/dev/null
+            printf 'started %s as %s\n' "$image" "$alias"
+          done
+
+      - name: wait for the services
+        run: |
+          set -euo pipefail
+          jq -c '.services[] | select(.ready)' /tmp/job.json | while read -r service; do
+            image="$(printf '%s' "$service" | jq -r .image)"
+            alias="$(printf '%s' "$image" | sed 's|.*/||; s|[:@].*||')"
+            ready="$(printf '%s' "$service" | jq -r .ready)"
+            for _ in $(seq 1 60); do
+              if docker exec "$alias" sh -lc "$ready" >/dev/null 2>&1; then
+                printf '%s is ready\n' "$alias"; break
+              fi
+              sleep 2
+            done
+          done
+
+      - name: run
+        id: run
+        run: |
+          set -euo pipefail
+          lane="$(jq -r .lane /tmp/job.json)"
+          image="${{ inputs.lane-image-prefix }}${lane}:latest"
+          workdir="$(jq -r .workdir /tmp/job.json)"
+          timeout="$(jq -r .timeout /tmp/job.json)"
+
+          # setup and command as one script, so a failing install fails the job
+          # for the reason it actually failed rather than as a missing binary.
+          setup="$(jq -r '.setup // empty' /tmp/job.json)"
+          {
+            printf 'set -euo pipefail\n'
+            # `if`, not `[ -n "$x" ] && ...` — that returns non-zero when the
+            # manifest has no setup, and under `set -e` it takes the step with
+            # it. Every manifest without a setup line would have failed here.
+            if [ -n "$setup" ]; then printf '%s\n' "$setup"; fi
+            jq -r .command /tmp/job.json
+          } > /tmp/job.sh
+
+          # `timeout` around docker, not docker's own --stop-timeout, which
+          # only says how long to wait after asking a container to stop and
+          # would let a hung job run until the runner's own limit.
+          timeout --signal=TERM --kill-after=30 "$timeout" \
+            docker run --rm \
+              --network assay-net \
+              --env-file /tmp/job.env \
+              -v "$PWD:/workspace" \
+              -v /tmp/job.sh:/tmp/job.sh:ro \
+              -w "/workspace/${workdir}" \
+              "$image" bash /tmp/job.sh
+
+      # `always()`, because a failing run is exactly the one whose report
+      # somebody wants to read.
+      - name: collect the results
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/results
+          junit="$(jq -r .junit /tmp/job.json)"
+          workdir="$(jq -r .workdir /tmp/job.json)"
+          if [ -f "$workdir/$junit" ]; then
+            cp "$workdir/$junit" /tmp/results/junit.xml
+          else
+            printf '::warning::the manifest promised %s and the run did not produce it\n' "$junit"
+          fi
+          # globstar, or `**` is just `*` and every recursive bundle pattern
+          # silently collects nothing. nullglob so a pattern that matches
+          # nothing disappears rather than arriving as a literal filename.
+          shopt -s globstar nullglob
+          while read -r pattern; do
+            matches=("$workdir"/$pattern)
+            if [ ${#matches[@]} -eq 0 ]; then
+              printf '::warning::bundle pattern %s matched nothing\n' "$pattern"
+              continue
+            fi
+            cp -r --parents "${matches[@]}" /tmp/results/ 2>/dev/null || true
+          done < <(jq -r '.bundle[]' /tmp/job.json)
+
+      - name: name this run
+        if: always()
+        id: label
+        env:
+          COMBINATION: ${{ toJSON(matrix.combination) }}
+        run: |
+          label="$(printf '%s' "$COMBINATION" | jq -r 'to_entries | map("\(.value)") | join("-") // "default"')"
+          printf 'label=%s\n' "${label:-default}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: assay-${{ steps.label.outputs.label }}
+          path: /tmp/results
+          if-no-files-found: warn
+          retention-days: 14
