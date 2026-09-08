@@ -48,7 +48,9 @@ on:
         type: string
         default: ghcr.io/wtfalch/assay-cli:latest
       lane-image-prefix:
-        description: Lane images are "<prefix><lane>", by convention.
+        description: >-
+          Registry and path in front of the image `assay resolve` names — the
+          image itself, tag included, comes from the manifest's lane.
         type: string
         default: ghcr.io/wtfalch/assay-
 
@@ -203,8 +205,13 @@ jobs:
         id: run
         run: |
           set -euo pipefail
-          lane="$(jq -r .lane /tmp/job.json)"
-          image="${{ inputs.lane-image-prefix }}${lane}:latest"
+          # `.image` from the manifest, not a name built here. `assay resolve`
+          # renders it — `assay-linux-browsers:pw1.59` — because a lane may
+          # carry a variant and the variant is the image's tag. Appending
+          # `:latest` to a lane that already has one produced
+          # `assay-linux-browsers:pw1.59:latest` and `docker: invalid reference
+          # format`, which is what this whole field exists to prevent.
+          image="${{ inputs.lane-image-prefix }}$(jq -r .image /tmp/job.json)"
           workdir="$(jq -r .workdir /tmp/job.json)"
           timeout="$(jq -r .timeout /tmp/job.json)"
 
