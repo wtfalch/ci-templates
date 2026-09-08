@@ -78,6 +78,8 @@ jobs:
     outputs:
       jobs: ${{ steps.expand.outputs.jobs }}
       lane: ${{ steps.expand.outputs.lane }}
+      runs-on: ${{ steps.expand.outputs.runs-on }}
+      resolved: ${{ steps.expand.outputs.resolved }}
     steps:
       - uses: actions/checkout@v4
 
@@ -106,16 +108,52 @@ jobs:
           set -euo pipefail
           jobs="$(docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
             expand "${{ inputs.manifest }}")"
-          lane="$(docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
-            resolve "${{ inputs.manifest }}" | jq -r .lane)"
+
+          # Every combination is resolved HERE, on Linux, and carried to the
+          # run jobs as a map.
+          #
+          # Not an optimisation — a necessity. `assay-cli` is a Linux image and
+          # a Windows runner cannot run Linux containers, so a `windows` job
+          # has no way to ask the CLI anything. Resolving up front means the
+          # run job needs no CLI at all: it reads its own entry and executes.
+          #
+          # Keyed by the combination itself, compact and sorted, so the run job
+          # can compute the same key from `matrix.combination` without an index
+          # or a label to keep in step.
+          resolved='{}'
+          while read -r combo; do
+            [ -n "$combo" ] || continue
+            one="$(docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
+              resolve "${{ inputs.manifest }}" "$combo")"
+            key="$(printf '%s' "$combo" | jq -cS .)"
+            resolved="$(jq -c --arg k "$key" --argjson v "$one" '. + {($k): $v}' <<<"$resolved")"
+          done < <(printf '%s' "$jobs" | jq -c '.[]')
+
+          first="$(printf '%s' "$resolved" | jq -c 'to_entries[0].value')"
+          lane="$(printf '%s' "$first" | jq -r .lane)"
+
+          # Which machine the run jobs need. A container lane runs its image on
+          # Linux; a runner lane asks for the machine the lane names, because
+          # no image would help.
+          if [ "$(printf '%s' "$first" | jq -r .execution)" = "runner" ]; then
+            runs_on="$(printf '%s' "$first" | jq -r .runsOn)"
+          else
+            runs_on="ubuntu-latest"
+          fi
+
           printf 'jobs=%s\n' "$jobs" >> "$GITHUB_OUTPUT"
           printf 'lane=%s\n' "$lane" >> "$GITHUB_OUTPUT"
-          printf '%s on lane %s\n' "$(printf '%s' "$jobs" | jq length) job(s)" "$lane" \
+          printf 'runs-on=%s\n' "$runs_on" >> "$GITHUB_OUTPUT"
+          printf 'resolved=%s\n' "$resolved" >> "$GITHUB_OUTPUT"
+          printf '%s on lane %s, running on %s\n' \
+            "$(printf '%s' "$jobs" | jq length) job(s)" "$lane" "$runs_on" \
             >> "$GITHUB_STEP_SUMMARY"
 
   run:
     needs: plan
-    runs-on: ubuntu-latest
+    # Decided by the manifest, not by this file. A container lane lands on
+    # Linux; a runner lane lands on whatever machine it named.
+    runs-on: ${{ needs.plan.outputs.runs-on }}
     timeout-minutes: 60
     strategy:
       # One combination failing must not cancel the others. A matrix where
@@ -143,14 +181,19 @@ jobs:
       # Written to a file rather than an output so nothing passes through
       # GitHub's own `${{ }}` interpolation — a manifest command legitimately
       # contains that syntax, and Actions would eat it.
-      - name: resolve this combination
+      # Already resolved, in the plan job, on Linux. This step only picks this
+      # combination's entry out of the map — no CLI, no container, and
+      # therefore nothing that a Windows runner cannot do.
+      - name: this combination's job
+        shell: bash
         env:
           COMBINATION: ${{ toJSON(matrix.combination) }}
+          RESOLVED: ${{ needs.plan.outputs.resolved }}
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
-            resolve "${{ inputs.manifest }}" "$COMBINATION" > /tmp/job.json
-          jq -r '"lane=\(.lane)  timeout=\(.timeout)s"' /tmp/job.json
+          key="$(printf '%s' "$COMBINATION" | jq -cS .)"
+          printf '%s' "$RESOLVED" | jq -e --arg k "$key" '.[$k]' > /tmp/job.json
+          jq -r '"lane=\(.lane)  execution=\(.execution)  timeout=\(.timeout)s"' /tmp/job.json
 
       # Secrets arrive wholesale through `secrets: inherit` and are filtered
       # here down to the names the manifest declares. That is safe because the
@@ -160,6 +203,7 @@ jobs:
       # Written to a file with restrictive permissions rather than passed as
       # `-e NAME=value`, which would put every value in the process list.
       - name: collect the declared secrets
+        shell: bash
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}
         run: |
@@ -182,7 +226,14 @@ jobs:
       # cannot be used: it is static YAML, and this list comes from a file that
       # does not exist until the job is running.
       - name: start the services
+        # Linux containers, so container lanes only — the check is inside the
+        # step because it reads the resolved job rather than anything Actions
+        # can see at expression time.
+        shell: bash
         run: |
+          if [ "$(jq -r .execution /tmp/job.json)" != "container" ]; then
+            echo "runner lane — no service containers"; exit 0
+          fi
           set -euo pipefail
           docker network create assay-net >/dev/null
           jq -c '.services[]' /tmp/job.json | while read -r service; do
@@ -200,7 +251,9 @@ jobs:
           done
 
       - name: wait for the services
+        shell: bash
         run: |
+          if [ "$(jq -r .execution /tmp/job.json)" != "container" ]; then exit 0; fi
           set -euo pipefail
           jq -c '.services[] | select(.ready)' /tmp/job.json | while read -r service; do
             image="$(printf '%s' "$service" | jq -r .image)"
@@ -216,6 +269,7 @@ jobs:
 
       - name: run
         id: run
+        shell: bash
         run: |
           set -euo pipefail
           # `.image` from the manifest, not a name built here. `assay resolve`
@@ -228,8 +282,8 @@ jobs:
           # valid reference to an image nobody has ever pushed, which is a
           # worse error than an invalid one because it reads as a missing
           # build.
-          image="${{ inputs.lane-image-registry }}$(jq -r .image /tmp/job.json)"
-          echo "using $image"
+          image="${{ inputs.lane-image-registry }}$(jq -r '.image // empty' /tmp/job.json)"
+          [ -n "$(jq -r '.image // empty' /tmp/job.json)" ] && echo "using $image" || echo "no image — running on the machine"
           workdir="$(jq -r .workdir /tmp/job.json)"
           timeout="$(jq -r .timeout /tmp/job.json)"
 
@@ -248,6 +302,24 @@ jobs:
           # `timeout` around docker, not docker's own --stop-timeout, which
           # only says how long to wait after asking a container to stop and
           # would let a hung job run until the runner's own limit.
+          if [ "$(jq -r .execution /tmp/job.json)" = "runner" ]; then
+            # No container: the machine IS the environment. The runner is
+            # already clean and is destroyed after the job, which is the
+            # isolation a container would have been providing.
+            #
+            # `timeout` is not assumed — it is coreutils and a Windows runner
+            # has git bash, not coreutils. The job-level `timeout-minutes` is
+            # the ceiling here instead, and the manifest's own timeout is
+            # advisory on this path. Said plainly rather than pretended.
+            set -a
+            # shellcheck disable=SC1091
+            . /tmp/job.env
+            set +a
+            cd "$workdir"
+            bash /tmp/job.sh
+            exit $?
+          fi
+
           # As the host's user, not the image's. The workspace is a checkout
           # owned by the runner (uid 1001 on GitHub's images) and the lane
           # image's own user is uid 1000, so the container writes nothing —
@@ -270,6 +342,7 @@ jobs:
       # somebody wants to read.
       - name: collect the results
         if: always()
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/results
@@ -302,25 +375,31 @@ jobs:
           label="$(printf '%s' "$COMBINATION" | jq -r 'to_entries | map("\(.value)") | join("-") // "default"')"
           printf 'label=%s\n' "${label:-default}" >> "$GITHUB_OUTPUT"
 
-      # JUnit into result rows, beside the report itself.
+      # The combination travels with the results, and the ingest happens in the
+      # report job.
       #
-      # Done here rather than in the report job because this is the only place
-      # that knows the matrix combination this job ran: the label is a rendered
-      # string, and the combination is the thing the analysis groups by.
-      - name: turn the results into rows
+      # It used to happen here, because this is the only place that knows which
+      # combination ran. That reason still holds — so the combination is
+      # written next to the JUnit rather than the ingest staying. `assay-cli`
+      # is a Linux image and a Windows runner cannot run Linux containers, so a
+      # step here that shells into the CLI is a step that works on three lanes
+      # and not the fourth.
+      - name: label the results with what produced them
         if: always()
+        shell: bash
         env:
           COMBINATION: ${{ toJSON(matrix.combination) }}
         run: |
           set -euo pipefail
-          [ -f /tmp/results/junit.xml ] || { echo "no junit.xml — nothing to ingest"; exit 0; }
-          docker run --rm -v /tmp/results:/w -w /w "${{ inputs.cli-image }}" \
-            ingest junit.xml \
-            --run "${{ github.run_id }}" \
-            --consumer "${{ github.repository }}" \
-            --lane "$(jq -r .lane /tmp/job.json)" \
-            --sha "${{ github.event.pull_request.head.sha || github.sha }}" \
-            --matrix "$COMBINATION" > /tmp/results/rows.json
+          mkdir -p /tmp/results
+          jq -n \
+            --argjson combination "$COMBINATION" \
+            --arg lane "$(jq -r .lane /tmp/job.json)" \
+            --arg run "${{ github.run_id }}" \
+            --arg consumer "${{ github.repository }}" \
+            --arg sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            '{combination: $combination, lane: $lane, run: $run, consumer: $consumer, sha: $sha}' \
+            > /tmp/results/context.json
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -386,8 +465,25 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s globstar nullglob
-          rows=(/tmp/runs/**/rows.json)
-          if [ ${#rows[@]} -eq 0 ]; then
+
+          # Ingest here, where Linux and the CLI image both exist. Each run job
+          # left its JUnit and a context file saying which combination produced
+          # it, which is everything `ingest` needs.
+          declare -a produced=()
+          for ctx in /tmp/runs/**/context.json; do
+            dir="$(dirname "$ctx")"
+            [ -f "$dir/junit.xml" ] || { echo "no junit.xml beside $ctx"; continue; }
+            docker run --rm -v "$dir:/w" -w /w "${{ inputs.cli-image }}" \
+              ingest junit.xml \
+              --run "$(jq -r .run "$ctx")" \
+              --consumer "$(jq -r .consumer "$ctx")" \
+              --lane "$(jq -r .lane "$ctx")" \
+              --sha "$(jq -r .sha "$ctx")" \
+              --matrix "$(jq -c .combination "$ctx")" > "$dir/rows.json"
+            produced+=("$dir/rows.json")
+          done
+
+          if [ ${#produced[@]} -eq 0 ]; then
             echo "no rows to report on" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -395,8 +491,8 @@ jobs:
           # One array from every job's rows. `add` on an empty input is null,
           # which would then read as a file containing "null" rather than an
           # empty report, so the guard above is doing real work.
-          jq -s 'add' "${rows[@]}" > /tmp/all-rows.json
-          echo "$(jq length /tmp/all-rows.json) rows from ${#rows[@]} job(s)"
+          jq -s 'add' "${produced[@]}" > /tmp/all-rows.json
+          echo "$(jq length /tmp/all-rows.json) rows from ${#produced[@]} job(s)"
 
           # Fold this run into whatever the cache had. A missing history is an
           # empty one — the first run for a consumer, and an evicted cache, are
