@@ -29,10 +29,19 @@ name: assay test run
 # `secrets: inherit` only matters if the manifest declares any under `secrets:`;
 # a manifest that declares none needs no secrets line at all.
 #
-# The images this pulls are PRIVATE. A calling repository must be granted pull
-# access on each package (package settings → Manage Actions access → add
-# repository, role Read) or the first docker pull fails with a denied error
-# that reads like the image does not exist.
+# The images this pulls are PRIVATE, and a calling repository needs pull access
+# granted on EACH of them: package settings → Manage Actions access → add
+# repository, role Read. There are always two, and forgetting the first is the
+# easy mistake because it is not the one the manifest names:
+#
+#   assay-cli            every job — validate, resolve, ingest, report
+#   assay-<the lane>     the `run` job only, e.g. assay-linux,
+#                        assay-linux-browsers, assay-linux-gui
+#
+# Without a grant the pull fails with `docker: Error response from daemon:
+# denied`, which names neither the image nor the permission. The step below
+# prints which image it is about to pull, so the log at least says what to go
+# and grant.
 
 on:
   workflow_call:
@@ -85,6 +94,9 @@ jobs:
 
       - name: is this manifest runnable
         run: |
+          # Named before it is pulled, because `denied` does not say which
+          # image it was denied.
+          echo "using ${{ inputs.cli-image }}"
           docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
             validate "${{ inputs.manifest }}"
 
@@ -217,6 +229,7 @@ jobs:
           # worse error than an invalid one because it reads as a missing
           # build.
           image="${{ inputs.lane-image-registry }}$(jq -r .image /tmp/job.json)"
+          echo "using $image"
           workdir="$(jq -r .workdir /tmp/job.json)"
           timeout="$(jq -r .timeout /tmp/job.json)"
 
