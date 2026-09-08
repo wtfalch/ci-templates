@@ -277,6 +277,26 @@ jobs:
           label="$(printf '%s' "$COMBINATION" | jq -r 'to_entries | map("\(.value)") | join("-") // "default"')"
           printf 'label=%s\n' "${label:-default}" >> "$GITHUB_OUTPUT"
 
+      # JUnit into result rows, beside the report itself.
+      #
+      # Done here rather than in the report job because this is the only place
+      # that knows the matrix combination this job ran: the label is a rendered
+      # string, and the combination is the thing the analysis groups by.
+      - name: turn the results into rows
+        if: always()
+        env:
+          COMBINATION: ${{ toJSON(matrix.combination) }}
+        run: |
+          set -euo pipefail
+          [ -f /tmp/results/junit.xml ] || { echo "no junit.xml — nothing to ingest"; exit 0; }
+          docker run --rm -v /tmp/results:/w -w /w "${{ inputs.cli-image }}" \
+            ingest junit.xml \
+            --run "${{ github.run_id }}" \
+            --consumer "${{ github.repository }}" \
+            --lane "$(jq -r .lane /tmp/job.json)" \
+            --sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --matrix "$COMBINATION" > /tmp/results/rows.json
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -284,3 +304,61 @@ jobs:
           path: /tmp/results
           if-no-files-found: warn
           retention-days: 14
+
+  # What the whole matrix says, which no single job can.
+  #
+  # A lane disagreement — one commit, one test, a different answer per lane —
+  # needs nothing but this run: three engines have already produced the
+  # evidence and until now nobody put the three reports side by side. Flake
+  # needs history and therefore a store, which is a later decision; this job is
+  # the half that is free.
+  report:
+    needs: [plan, run]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: assay-*
+          path: /tmp/runs
+
+      - name: read them together
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          rows=(/tmp/runs/**/rows.json)
+          if [ ${#rows[@]} -eq 0 ]; then
+            echo "no rows to report on" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # One array from every job's rows. `add` on an empty input is null,
+          # which would then read as a file containing "null" rather than an
+          # empty report, so the guard above is doing real work.
+          jq -s 'add' "${rows[@]}" > /tmp/all-rows.json
+          echo "$(jq length /tmp/all-rows.json) rows from ${#rows[@]} job(s)"
+
+          {
+            echo '## assay'
+            echo
+            echo '```'
+            docker run --rm -v /tmp:/w -w /w "${{ inputs.cli-image }}" report all-rows.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assay-rows
+          path: /tmp/all-rows.json
+          if-no-files-found: warn
+          # Longer than the per-job bundles: these are the rows a store would
+          # ingest, and they are small.
+          retention-days: 90
