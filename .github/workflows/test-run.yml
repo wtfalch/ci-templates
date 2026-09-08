@@ -355,18 +355,36 @@ jobs:
 
       # `always()`, because a failing run is exactly the one whose report
       # somebody wants to read.
+      # Written into the workspace, not /tmp, and that is not a preference.
+      #
+      # `/tmp` means one thing to git bash on a Windows runner and another to a
+      # Node action: the bash steps wrote results happily and
+      # `upload-artifact` then found nothing there. It reports that as a
+      # WARNING, so the job stayed green and uploaded an empty artifact — the
+      # third time in this workflow that a wrong thing has been quiet rather
+      # than loud.
+      #
+      # A workspace-relative path is resolved the same way by both.
       - name: collect the results
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/results
+          mkdir -p assay-results
           junit="$(jq -r .junit /tmp/job.json)"
           workdir="$(jq -r .workdir /tmp/job.json)"
           if [ -f "$workdir/$junit" ]; then
-            cp "$workdir/$junit" /tmp/results/junit.xml
+            cp "$workdir/$junit" assay-results/junit.xml
+          elif [ "${{ steps.run.outcome }}" = "success" ]; then
+            # A run that passed and produced no JUnit is a run that reported
+            # nothing, and every downstream step would go quietly green on an
+            # empty artifact. That is a failure, not a warning.
+            printf '::error::the command succeeded but produced no %s — nothing to report on\n' "$junit"
+            exit 1
           else
-            printf '::warning::the manifest promised %s and the run did not produce it\n' "$junit"
+            # The command failed, so a missing report is a consequence rather
+            # than a second problem. Say it and let the real failure stand.
+            printf '::warning::no %s, and the command failed — the failure above is why\n' "$junit"
           fi
           # globstar, or `**` is just `*` and every recursive bundle pattern
           # silently collects nothing. nullglob so a pattern that matches
@@ -378,7 +396,7 @@ jobs:
               printf '::warning::bundle pattern %s matched nothing\n' "$pattern"
               continue
             fi
-            cp -r --parents "${matches[@]}" /tmp/results/ 2>/dev/null || true
+            cp -r --parents "${matches[@]}" assay-results/ 2>/dev/null || true
           done < <(jq -r '.bundle[]' /tmp/job.json)
 
       - name: name this run
@@ -407,7 +425,7 @@ jobs:
           COMBINATION: ${{ toJSON(matrix.combination) }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/results
+          mkdir -p assay-results
           jq -n \
             --argjson combination "$COMBINATION" \
             --arg lane "$(jq -r .lane /tmp/job.json)" \
@@ -415,13 +433,13 @@ jobs:
             --arg consumer "${{ github.repository }}" \
             --arg sha "${{ github.event.pull_request.head.sha || github.sha }}" \
             '{combination: $combination, lane: $lane, run: $run, consumer: $consumer, sha: $sha}' \
-            > /tmp/results/context.json
+            > assay-results/context.json
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ needs.plan.outputs.scope }}-${{ steps.label.outputs.label }}
-          path: /tmp/results
+          path: assay-results
           if-no-files-found: warn
           retention-days: 14
 
