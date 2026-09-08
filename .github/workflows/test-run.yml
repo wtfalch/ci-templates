@@ -355,6 +355,33 @@ jobs:
           pattern: assay-*
           path: /tmp/runs
 
+      # Where the history lives, and why it is a cache.
+      #
+      # Flake is two different answers about one commit, so it cannot be seen
+      # in a single run — the store is what makes the headline query possible
+      # at all. What holds it had one hard constraint: the job that writes it
+      # is the job that will one day run a customer's code, so it must not
+      # hold a credential worth stealing or a write token for anything.
+      #
+      # A cache satisfies that. It needs no secret, no bucket, and no write
+      # permission on the repository, and it is scoped to the calling repo so
+      # one consumer's history is its own. The price is that it is a rolling
+      # window and not an archive: GitHub evicts entries unused for a week, and
+      # a lost cache means the history restarts rather than the run failing.
+      # That is an acceptable price for a query whose evidence stops being
+      # useful about when the commit does.
+      #
+      # `restore-keys` is what makes it a rolling store rather than a set of
+      # unrelated entries: the key carries the run id so every save is a new
+      # entry, and the prefix restores the most recent previous one.
+      - name: the history so far
+        id: history
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/history
+          key: assay-history-${{ github.repository_id }}-${{ github.run_id }}
+          restore-keys: assay-history-${{ github.repository_id }}-
+
       - name: read them together
         run: |
           set -euo pipefail
@@ -371,13 +398,29 @@ jobs:
           jq -s 'add' "${rows[@]}" > /tmp/all-rows.json
           echo "$(jq length /tmp/all-rows.json) rows from ${#rows[@]} job(s)"
 
+          # Fold this run into whatever the cache had. A missing history is an
+          # empty one — the first run for a consumer, and an evicted cache, are
+          # the same situation and neither is an error.
+          mkdir -p /tmp/history
+          docker run --rm -v /tmp:/w -w /w "${{ inputs.cli-image }}" \
+            merge history/rows.json all-rows.json > /tmp/history-next.json
+          mv /tmp/history-next.json /tmp/history/rows.json
+
           {
             echo '## assay'
             echo
             echo '```'
-            docker run --rm -v /tmp:/w -w /w "${{ inputs.cli-image }}" report all-rows.json
+            docker run --rm -v /tmp:/w -w /w "${{ inputs.cli-image }}" report history/rows.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Saved after the report, so a run that fails to report does not poison
+      # the history with rows nobody has looked at.
+      - name: keep the history
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/history
+          key: assay-history-${{ github.repository_id }}-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v4
         with:
