@@ -18,6 +18,11 @@ name: assay test run
 #
 # `secrets: inherit` only matters if the manifest declares any under `secrets:`;
 # a manifest that declares none needs no secrets line at all.
+#
+# The images this pulls are PRIVATE. A calling repository must be granted pull
+# access on each package (package settings → Manage Actions access → add
+# repository, role Read) or the first docker pull fails with a denied error
+# that reads like the image does not exist.
 
 on:
   workflow_call:
@@ -54,6 +59,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The lane and cli images are private, published from a private
+      # repository. A caller reaches them with its own GITHUB_TOKEN once the
+      # package grants that repository pull access (package settings → Manage
+      # Actions access → add repository, role Read). Nothing here is public.
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       - name: is this manifest runnable
         run: |
           docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
@@ -85,6 +101,17 @@ jobs:
         combination: ${{ fromJSON(needs.plan.outputs.jobs) }}
     steps:
       - uses: actions/checkout@v4
+
+      # The lane and cli images are private, published from a private
+      # repository. A caller reaches them with its own GITHUB_TOKEN once the
+      # package grants that repository pull access (package settings → Manage
+      # Actions access → add repository, role Read). Nothing here is public.
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       # The resolved job: the command with `${{ matrix.x }}` already
       # substituted, and the service list, timeouts and result paths beside it.
