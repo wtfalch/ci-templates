@@ -13,8 +13,18 @@ name: assay test run
 #
 #   jobs:
 #     e2e:
+#       permissions:
+#         contents: read
+#         packages: read      # REQUIRED — see below
 #       uses: wtfalch/ci-templates/.github/workflows/test-run.yml@main
 #       secrets: inherit
+#
+# `packages: read` is not optional and not obvious. This workflow pulls private
+# images with the caller's token, and a called workflow cannot request more
+# permission than its caller holds. Omit it and GitHub refuses the run before
+# any job starts, reporting "this run likely failed because of a workflow file
+# issue" — with no jobs, no check runs and no log. The YAML is fine; the
+# permission is missing, and nothing in that message says so.
 #
 # `secrets: inherit` only matters if the manifest declares any under `secrets:`;
 # a manifest that declares none needs no secrets line at all.
