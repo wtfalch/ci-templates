@@ -47,12 +47,13 @@ on:
           that matters; `latest` is a convenience, not a guarantee.
         type: string
         default: ghcr.io/wtfalch/assay-cli:latest
-      lane-image-prefix:
+      lane-image-registry:
         description: >-
-          Registry and path in front of the image `assay resolve` names — the
-          image itself, tag included, comes from the manifest's lane.
+          Registry and namespace only, with a trailing slash. The image name
+          and tag come from the manifest, via `assay resolve` — this is the one
+          part of the reference the pipeline does not know.
         type: string
-        default: ghcr.io/wtfalch/assay-
+        default: ghcr.io/wtfalch/
 
 permissions:
   contents: read
@@ -206,12 +207,16 @@ jobs:
         run: |
           set -euo pipefail
           # `.image` from the manifest, not a name built here. `assay resolve`
-          # renders it — `assay-linux-browsers:pw1.59` — because a lane may
-          # carry a variant and the variant is the image's tag. Appending
-          # `:latest` to a lane that already has one produced
-          # `assay-linux-browsers:pw1.59:latest` and `docker: invalid reference
-          # format`, which is what this whole field exists to prevent.
-          image="${{ inputs.lane-image-prefix }}$(jq -r .image /tmp/job.json)"
+          # renders the whole name and tag — `assay-linux-browsers:pw1.59` —
+          # because a lane may carry a variant and the variant is the tag.
+          #
+          # The input is a registry and namespace ONLY. It used to end in
+          # `assay-` as well, which doubled the prefix into
+          # `assay-assay-linux-browsers` and produced `manifest unknown` — a
+          # valid reference to an image nobody has ever pushed, which is a
+          # worse error than an invalid one because it reads as a missing
+          # build.
+          image="${{ inputs.lane-image-registry }}$(jq -r .image /tmp/job.json)"
           workdir="$(jq -r .workdir /tmp/job.json)"
           timeout="$(jq -r .timeout /tmp/job.json)"
 
