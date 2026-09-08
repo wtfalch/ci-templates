@@ -80,6 +80,7 @@ jobs:
       lane: ${{ steps.expand.outputs.lane }}
       runs-on: ${{ steps.expand.outputs.runs-on }}
       resolved: ${{ steps.expand.outputs.resolved }}
+      scope: ${{ steps.expand.outputs.scope }}
     steps:
       - uses: actions/checkout@v4
 
@@ -143,6 +144,18 @@ jobs:
             runs_on="ubuntu-latest"
           fi
 
+          # Everything this run writes is named after the manifest, because a
+          # repository may call this workflow more than once in one run — one
+          # manifest per lane is the shape a second operating system takes.
+          #
+          # Without it two callers share an artifact namespace and a cache key,
+          # and the failure is silent and wrong rather than loud: the second
+          # upload collides, the second report downloads the FIRST caller's
+          # results, and a green Windows report describes a Linux run. Measured
+          # on tf-web the first time it had two manifests.
+          scope="$(printf '%s' "${{ inputs.manifest }}" | tr -c 'A-Za-z0-9' '-' | sed -E 's/-+/-/g; s/^-|-$//g')"
+
+          printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
           printf 'jobs=%s\n' "$jobs" >> "$GITHUB_OUTPUT"
           printf 'lane=%s\n' "$lane" >> "$GITHUB_OUTPUT"
           printf 'runs-on=%s\n' "$runs_on" >> "$GITHUB_OUTPUT"
@@ -407,7 +420,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: assay-${{ steps.label.outputs.label }}
+          name: ${{ needs.plan.outputs.scope }}-${{ steps.label.outputs.label }}
           path: /tmp/results
           if-no-files-found: warn
           retention-days: 14
@@ -434,7 +447,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: assay-*
+          pattern: ${{ needs.plan.outputs.scope }}-*
           path: /tmp/runs
 
       # Where the history lives, and why it is a cache.
@@ -461,8 +474,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /tmp/history
-          key: assay-history-${{ github.repository_id }}-${{ github.run_id }}
-          restore-keys: assay-history-${{ github.repository_id }}-
+          key: assay-history-${{ github.repository_id }}-${{ needs.plan.outputs.scope }}-${{ github.run_id }}
+          restore-keys: assay-history-${{ github.repository_id }}-${{ needs.plan.outputs.scope }}-
 
       - name: read them together
         shell: bash
@@ -520,11 +533,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: /tmp/history
-          key: assay-history-${{ github.repository_id }}-${{ github.run_id }}
+          key: assay-history-${{ github.repository_id }}-${{ needs.plan.outputs.scope }}-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: assay-rows
+          name: ${{ needs.plan.outputs.scope }}-rows
           path: /tmp/all-rows.json
           if-no-files-found: warn
           # Longer than the per-job bundles: these are the rows a store would
