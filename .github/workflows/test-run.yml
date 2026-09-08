@@ -95,6 +95,7 @@ jobs:
           password: ${{ github.token }}
 
       - name: is this manifest runnable
+        shell: bash
         run: |
           # Named before it is pulled, because `denied` does not say which
           # image it was denied.
@@ -104,6 +105,7 @@ jobs:
 
       - id: expand
         name: what does it expand to
+        shell: bash
         run: |
           set -euo pipefail
           jobs="$(docker run --rm -v "$PWD:/w" -w /w "${{ inputs.cli-image }}" \
@@ -371,6 +373,7 @@ jobs:
         id: label
         env:
           COMBINATION: ${{ toJSON(matrix.combination) }}
+        shell: bash
         run: |
           label="$(printf '%s' "$COMBINATION" | jq -r 'to_entries | map("\(.value)") | join("-") // "default"')"
           printf 'label=%s\n' "${label:-default}" >> "$GITHUB_OUTPUT"
@@ -462,6 +465,7 @@ jobs:
           restore-keys: assay-history-${{ github.repository_id }}-
 
       - name: read them together
+        shell: bash
         run: |
           set -euo pipefail
           shopt -s globstar nullglob
