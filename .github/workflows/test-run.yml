@@ -79,7 +79,6 @@ jobs:
       jobs: ${{ steps.expand.outputs.jobs }}
       lane: ${{ steps.expand.outputs.lane }}
       runs-on: ${{ steps.expand.outputs.runs-on }}
-      resolved: ${{ steps.expand.outputs.resolved }}
       scope: ${{ steps.expand.outputs.scope }}
     steps:
       - uses: actions/checkout@v4
@@ -159,10 +158,26 @@ jobs:
           printf 'jobs=%s\n' "$jobs" >> "$GITHUB_OUTPUT"
           printf 'lane=%s\n' "$lane" >> "$GITHUB_OUTPUT"
           printf 'runs-on=%s\n' "$runs_on" >> "$GITHUB_OUTPUT"
-          printf 'resolved=%s\n' "$resolved" >> "$GITHUB_OUTPUT"
+          # NOT a job output. GitHub secret-scans outputs and silently SKIPS
+          # any that appear to contain a secret value — and a resolved manifest
+          # carries the consumer's `env`, so a value that happens to match one
+          # of their secrets (a test database password of `postgres`, say)
+          # makes the whole output vanish. The plan job then passes, the run
+          # job reads an empty string, and `jq -e` exits 4 with nothing to say.
+          #
+          # An artifact is not scanned and not truncated, and it survives the
+          # trip to a Windows runner, which a file in /tmp would not.
+          printf '%s' "$resolved" > resolved.json
           printf '%s on lane %s, running on %s\n' \
             "$(printf '%s' "$jobs" | jq length) job(s)" "$lane" "$runs_on" \
             >> "$GITHUB_STEP_SUMMARY"
+
+      - name: hand the resolved jobs to the run jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.expand.outputs.scope }}-plan
+          path: resolved.json
+          retention-days: 1
 
   run:
     needs: plan
@@ -199,15 +214,22 @@ jobs:
       # Already resolved, in the plan job, on Linux. This step only picks this
       # combination's entry out of the map — no CLI, no container, and
       # therefore nothing that a Windows runner cannot do.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.plan.outputs.scope }}-plan
+          path: .
+
       - name: this combination's job
         shell: bash
         env:
           COMBINATION: ${{ toJSON(matrix.combination) }}
-          RESOLVED: ${{ needs.plan.outputs.resolved }}
         run: |
           set -euo pipefail
           key="$(printf '%s' "$COMBINATION" | jq -cS .)"
-          printf '%s' "$RESOLVED" | jq -e --arg k "$key" '.[$k]' > /tmp/job.json
+          # `jq -e` exits non-zero when the key is absent, which is the whole
+          # guard: a combination with no resolved entry is a bug here, not a
+          # job to run with an empty config.
+          jq -e --arg k "$key" '.[$k]' resolved.json > /tmp/job.json
           jq -r '"lane=\(.lane)  execution=\(.execution)  timeout=\(.timeout)s"' /tmp/job.json
 
       # Secrets arrive wholesale through `secrets: inherit` and are filtered
