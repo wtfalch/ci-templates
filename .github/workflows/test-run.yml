@@ -253,7 +253,11 @@ jobs:
           docker network create assay-net >/dev/null
           jq -c '.services[]' /tmp/job.json | while read -r service; do
             image="$(printf '%s' "$service" | jq -r .image)"
-            alias="$(printf '%s' "$image" | sed 's|.*/||; s|[:@].*||')"
+            # The hostname comes from `assay resolve`, not from parsing the
+            # image here. It is what the consumer puts in a connection string,
+            # so it belongs in the contract — a name computed in two places is
+            # a name that eventually differs.
+            alias="$(printf '%s' "$service" | jq -r .name)"
             # An array, not a string: a value with a space in it splits into
             # two arguments otherwise, and the failure looks like a bad image.
             args=()
@@ -271,15 +275,23 @@ jobs:
           if [ "$(jq -r .execution /tmp/job.json)" != "container" ]; then exit 0; fi
           set -euo pipefail
           jq -c '.services[] | select(.ready)' /tmp/job.json | while read -r service; do
-            image="$(printf '%s' "$service" | jq -r .image)"
-            alias="$(printf '%s' "$image" | sed 's|.*/||; s|[:@].*||')"
+            alias="$(printf '%s' "$service" | jq -r .name)"
             ready="$(printf '%s' "$service" | jq -r .ready)"
+            ok=""
             for _ in $(seq 1 60); do
               if docker exec "$alias" sh -lc "$ready" >/dev/null 2>&1; then
-                printf '%s is ready\n' "$alias"; break
+                printf '%s is ready\n' "$alias"; ok=1; break
               fi
               sleep 2
             done
+            # A service that never came up is not something to discover from a
+            # connection refused two minutes into a suite. Previously this loop
+            # gave up silently and let the job run against nothing.
+            if [ -z "$ok" ]; then
+              printf '::error::%s never became ready — `%s` did not succeed in 120s\n' "$alias" "$ready"
+              docker logs "$alias" 2>&1 | tail -30
+              exit 1
+            fi
           done
 
       - name: run
