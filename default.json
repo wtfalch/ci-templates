@@ -1,0 +1,50 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "The wtfalch estate preset. Every repo extends this, so a version the estate shares is decided in one file instead of twenty. Extend it with \"extends\": [\"github>wtfalch/ci-templates\"].",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    "schedule:earlyMondays"
+  ],
+  "labels": ["dependencies"],
+  "prHourlyLimit": 4,
+  "packageRules": [
+    {
+      "description": "Group all non-major npm updates into a single weekly PR",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "all non-major npm dependencies"
+    },
+    {
+      "description": "Group GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "THE POSTGRES MAJOR THE ESTATE RUNS. This is the source of truth: raise the ceiling here and every repo gets a pull request moving it up, lower it and nothing is proposed. The tag is hardcoded two or three times per repo -- a CI service container, a compose file, a string inside a script -- so no repo is the place to decide it. 17 is where auth, jobs, keys, raincheck, raincheck-dos, lokessmie-app and package-template already are; the remaining repos are on 16 and will each get one pull request.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["postgres"],
+      "allowedVersions": "<18",
+      "groupName": null,
+      "labels": ["dependencies", "estate"]
+    },
+    {
+      "description": "Estate packages get their own pull request, never grouped. They are pinned exactly on purpose, a minor can change behaviour inside a 0.x, and a bump that arrives inside a ten-package group is a bump nobody read. This rule is LAST because Renovate lets a later rule override an earlier one, and the npm grouping rule above would otherwise pull these back in.",
+      "matchPackageNames": ["@wtfalch/**"],
+      "groupName": null,
+      "separateMinorPatch": true,
+      "labels": ["dependencies", "estate"]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Postgres image tags written as string literals in TypeScript and scripts. No manager parses those, so without this the Coolify bootstrap step and every docker-run helper drift away from the CI pin silently.",
+      "managerFilePatterns": ["/\\.(ts|mjs|js)$/"],
+      "matchStrings": ["['\"`](?<depName>postgres):(?<currentValue>[0-9]+(?:\\.[0-9]+)*(?:-alpine)?)['\"`]"],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    }
+  ]
+}
