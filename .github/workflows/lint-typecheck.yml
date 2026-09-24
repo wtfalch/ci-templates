@@ -18,9 +18,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# One job, not four. Each job paid for its own checkout and install and was
+# billed rounded up to a whole minute, so four parallel jobs cost about three
+# times the minutes of the same steps in a row.
 jobs:
-  lint:
-    name: Lint
+  check:
+    name: Check & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,52 +34,12 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
-
-  typecheck:
-    name: Typecheck
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
-
-  test:
-    name: Unit tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
       - run: pnpm test
 
-  e2e:
-    name: Build & Playwright e2e
-    if: ${{ inputs.run-e2e }}
-    runs-on: ubuntu-latest
-    env:
-      # Stub envs so `next build` and `next start` succeed without real Supabase.
-      # The home + login Playwright smoke tests don't make authenticated requests.
-      # Apps that add e2e tests hitting Supabase must layer real envs in the caller.
-      NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:54321
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: stub-anon-key-for-build
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      # Build & Playwright e2e, behind `run-e2e`.
       - name: Cache Playwright browsers
+        if: ${{ inputs.run-e2e }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -84,6 +47,7 @@ jobs:
       # Warm Next's incremental build cache between runs. Keyed on the lockfile
       # plus source so unrelated commits restore from the most recent neighbour.
       - name: Cache Next build cache
+        if: ${{ inputs.run-e2e }}
         uses: actions/cache@v4
         with:
           path: .next/cache
@@ -91,10 +55,22 @@ jobs:
           restore-keys: |
             nextcache-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
             nextcache-${{ runner.os }}-
-      - run: pnpm exec playwright install --with-deps chromium
-      - run: pnpm build
-      - run: pnpm test:e2e
-      - if: failure()
+      - if: ${{ inputs.run-e2e }}
+        run: pnpm exec playwright install --with-deps chromium
+      # Stub envs so `next build` and `next start` succeed without real Supabase.
+      # The home + login Playwright smoke tests don't make authenticated requests.
+      # Apps that add e2e tests hitting Supabase must layer real envs in the caller.
+      - if: ${{ inputs.run-e2e }}
+        run: pnpm build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:54321
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: stub-anon-key-for-build
+      - if: ${{ inputs.run-e2e }}
+        run: pnpm test:e2e
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:54321
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: stub-anon-key-for-build
+      - if: ${{ failure() && inputs.run-e2e }}
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
