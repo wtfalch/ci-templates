@@ -12,6 +12,9 @@ on:
         required: false
         default: true
 
+permissions:
+  contents: read
+
 # Cancel in-flight CI for a branch when a newer commit lands; we don't need
 # stale runs blocking the queue. Deploys are gated separately.
 concurrency:
