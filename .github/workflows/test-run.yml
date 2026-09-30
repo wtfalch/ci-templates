@@ -81,14 +81,14 @@ jobs:
       runs-on: ${{ steps.expand.outputs.runs-on }}
       scope: ${{ steps.expand.outputs.scope }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # The lane and cli images are private, published from a private
       # repository. A caller reaches them with its own GITHUB_TOKEN once the
       # package grants that repository pull access (package settings → Manage
       # Actions access → add repository, role Read). Nothing here is public.
       - name: log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -173,7 +173,7 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: hand the resolved jobs to the run jobs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ${{ steps.expand.outputs.scope }}-plan
           path: resolved.json
@@ -193,14 +193,14 @@ jobs:
       matrix:
         combination: ${{ fromJSON(needs.plan.outputs.jobs) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # The lane and cli images are private, published from a private
       # repository. A caller reaches them with its own GITHUB_TOKEN once the
       # package grants that repository pull access (package settings → Manage
       # Actions access → add repository, role Read). Nothing here is public.
       - name: log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -214,7 +214,7 @@ jobs:
       # Already resolved, in the plan job, on Linux. This step only picks this
       # combination's entry out of the map — no CLI, no container, and
       # therefore nothing that a Windows runner cannot do.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: ${{ needs.plan.outputs.scope }}-plan
           path: .
@@ -469,7 +469,7 @@ jobs:
             '{combination: $combination, lane: $lane, run: $run, consumer: $consumer, sha: $sha}' \
             > assay-results/context.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
           name: ${{ needs.plan.outputs.scope }}-${{ steps.label.outputs.label }}
@@ -491,13 +491,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           pattern: ${{ needs.plan.outputs.scope }}-*
           path: /tmp/runs
@@ -523,7 +523,7 @@ jobs:
       # entry, and the prefix restores the most recent previous one.
       - name: the history so far
         id: history
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: /tmp/history
           key: assay-history-${{ github.repository_id }}-${{ needs.plan.outputs.scope }}-${{ github.run_id }}
@@ -582,12 +582,12 @@ jobs:
       # Saved after the report, so a run that fails to report does not poison
       # the history with rows nobody has looked at.
       - name: keep the history
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: /tmp/history
           key: assay-history-${{ github.repository_id }}-${{ needs.plan.outputs.scope }}-${{ github.run_id }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ${{ needs.plan.outputs.scope }}-rows
           path: /tmp/all-rows.json
