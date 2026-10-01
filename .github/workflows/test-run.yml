@@ -52,10 +52,11 @@ on:
         default: .assay.yml
       cli-image:
         description: >-
-          The image holding the assay CLI. Pin this to a digest in anything
-          that matters; `latest` is a convenience, not a guarantee.
+          The image holding the assay CLI. Defaults to a pinned digest,
+          bumped deliberately on an assay-cli release; override to track
+          `latest` instead, which is a convenience, not a guarantee.
         type: string
-        default: ghcr.io/wtfalch/assay-cli:latest
+        default: ghcr.io/wtfalch/assay-cli@sha256:0e8bc908109e07d791eb674cb2e86e614bc24dd123bb79664ff6a13dc1ab04ad
       lane-image-registry:
         description: >-
           Registry and namespace only, with a trailing slash. The image name
