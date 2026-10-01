@@ -10,6 +10,12 @@ description: >-
 #   - one place to update the version pin
 #   - lets caller workflows invoke it as a single `uses:` step
 #
+# sops-version and sops-sha256 are bumped together. The hash is the
+# linux/amd64 entry from that version's own
+# https://github.com/getsops/sops/releases/download/v<version>/sops-v<version>.checksums.txt
+# — not invented here, just pinned so a corrupted or substituted download
+# fails the install instead of being handed the decryption key.
+#
 # Caller pattern:
 #   - uses: wtfalch/ci-templates/.github/actions/decrypt-secrets@main
 #     with:
@@ -28,6 +34,11 @@ inputs:
   sops-version:
     description: Pinned sops version (only used if sops isn't already on PATH)
     default: '3.9.4'
+  sops-sha256:
+    description: >-
+      Expected sha256 of sops-v<sops-version>.linux.amd64, from that
+      release's own checksums.txt. Bump together with sops-version.
+    default: '5488e32bc471de7982ad895dd054bbab3ab91c417a118426134551e9626e4e85'
 
 runs:
   using: composite
@@ -42,6 +53,7 @@ runs:
         VERSION="${{ inputs.sops-version }}"
         URL="https://github.com/getsops/sops/releases/download/v${VERSION}/sops-v${VERSION}.linux.amd64"
         curl -fsSL "$URL" -o /tmp/sops
+        echo "${{ inputs.sops-sha256 }}  /tmp/sops" | sha256sum -c -
         sudo install -m 0755 /tmp/sops /usr/local/bin/sops
         rm /tmp/sops
         echo "installed sops $(sops --version | head -1)"
