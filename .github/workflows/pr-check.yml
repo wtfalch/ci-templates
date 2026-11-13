@@ -1,0 +1,304 @@
+name: PR check
+
+# The pull-request test gate. A caller runs it on `pull_request`; it runs lint,
+# typecheck, the full unit suite (optionally sharded) and, by input, build,
+# migrations check and integration tests in parallel jobs, then posts the
+# commit status `tests` on the PR head SHA.
+#
+# Caller (.github/workflows/pr-check.yml in the repo):
+#
+#   on: pull_request
+#   concurrency:
+#     group: pr-check-${{ github.event.pull_request.number }}
+#     cancel-in-progress: true
+#   permissions:
+#     contents: read
+#     statuses: write
+#   jobs:
+#     check:
+#       uses: wtfalch/ci-templates/.github/workflows/pr-check.yml@main
+#       with: {}
+#
+# Permissions: only `start` and `report` hold `statuses: write`, and they check
+# out nothing and run no pull-request code. Every job that runs pull-request
+# code holds `contents: read` only. Pull requests from forks are skipped.
+# There is no changed-only mode: the whole unit suite always runs.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: runs-on label for every job.
+        type: string
+        default: ubuntu-latest
+      node-version:
+        type: string
+        default: '22'
+      node-version-file:
+        description: Path such as .nvmrc. When set, it replaces node-version.
+        type: string
+        default: ''
+      lint-command:
+        type: string
+        default: pnpm lint
+      typecheck-command:
+        type: string
+        default: pnpm typecheck
+      test-command:
+        description: Unit tests. With shards > 1, `--shard=i/n` is appended.
+        type: string
+        default: pnpm test
+      shards:
+        description: Number of parallel unit-test jobs (vitest --shard).
+        type: number
+        default: 1
+      run-lint:
+        type: boolean
+        default: true
+      run-typecheck:
+        type: boolean
+        default: true
+      run-build:
+        type: boolean
+        default: false
+      build-command:
+        type: string
+        default: pnpm build
+      run-migrations:
+        type: boolean
+        default: false
+      migrations-command:
+        type: string
+        default: pnpm check:migrations
+      run-integration:
+        type: boolean
+        default: false
+      integration-command:
+        type: string
+        default: pnpm test:integration
+      postgres-image:
+        type: string
+        default: postgres:16-alpine
+      postgres-port:
+        description: Host port for the Postgres service; the URL below uses it.
+        type: number
+        default: 5432
+      integration-database-url-var:
+        description: Name of the env var that receives the database URL.
+        type: string
+        default: TEST_DATABASE_URL
+
+env:
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  start:
+    name: Start
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - id: plan
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          n=$SHARDS
+          case "$n" in ''|*[!0-9]*|0) n=1 ;; esac
+          echo "shards=$(seq -s, 1 "$n" | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+      - name: Post pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=pending -f context=tests \
+            -f description="Checks are running" -f target_url="$RUN_URL"
+
+  lint:
+    name: Lint
+    needs: start
+    if: inputs.run-lint
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: ${{ inputs.lint-command }}
+
+  typecheck:
+    name: Typecheck
+    needs: start
+    if: inputs.run-typecheck
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: ${{ inputs.typecheck-command }}
+
+  unit:
+    name: Unit tests
+    needs: start
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.start.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run unit tests
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+          SHARDS: ${{ inputs.shards }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          if [ "$SHARDS" -gt 1 ]; then
+            $TEST_COMMAND --shard="$SHARD/$SHARDS"
+          else
+            $TEST_COMMAND
+          fi
+
+  build:
+    name: Build
+    needs: start
+    if: inputs.run-build
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: ${{ inputs.build-command }}
+
+  migrations:
+    name: Migrations check
+    needs: start
+    if: inputs.run-migrations
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: ${{ inputs.migrations-command }}
+
+  integration:
+    name: Integration (Postgres)
+    needs: start
+    if: inputs.run-integration
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: ${{ inputs.postgres-image }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - ${{ inputs.postgres-port }}:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run integration tests
+        env:
+          INTEGRATION_COMMAND: ${{ inputs.integration-command }}
+          URL_VAR: ${{ inputs.integration-database-url-var }}
+          DB_URL: postgres://postgres:postgres@127.0.0.1:${{ inputs.postgres-port }}/postgres
+        run: env "$URL_VAR=$DB_URL" $INTEGRATION_COMMAND
+
+  # Runs no pull-request code. A needed job that did not succeed, was skipped
+  # without being switched off, or was cancelled is a failure.
+  report:
+    name: Report
+    needs: [start, lint, typecheck, unit, build, migrations, integration]
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: Post result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R_START: ${{ needs.start.result }}
+          R_UNIT: ${{ needs.unit.result }}
+          R_LINT: ${{ inputs.run-lint && needs.lint.result || 'off' }}
+          R_TYPECHECK: ${{ inputs.run-typecheck && needs.typecheck.result || 'off' }}
+          R_BUILD: ${{ inputs.run-build && needs.build.result || 'off' }}
+          R_MIGRATIONS: ${{ inputs.run-migrations && needs.migrations.result || 'off' }}
+          R_INTEGRATION: ${{ inputs.run-integration && needs.integration.result || 'off' }}
+        run: |
+          bad=""
+          for pair in start:"$R_START" lint:"$R_LINT" typecheck:"$R_TYPECHECK" unit:"$R_UNIT" \
+                      build:"$R_BUILD" migrations:"$R_MIGRATIONS" integration:"$R_INTEGRATION"; do
+            name=${pair%%:*}; res=${pair#*:}
+            case "$res" in
+              success|off) ;;
+              *) bad="$bad $name($res)" ;;
+            esac
+          done
+          if [ -z "$bad" ]; then
+            state=success; desc="All checks passed"
+          else
+            state=failure; desc="Not passed:${bad}"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$state" -f context=tests \
+            -f description="${desc:0:140}" -f target_url="$RUN_URL"
+          [ "$state" = success ]
