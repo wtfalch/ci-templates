@@ -76,6 +76,13 @@ on:
       integration-command:
         type: string
         default: pnpm test:integration
+      integration-shards:
+        description: >-
+          Number of parallel integration jobs (vitest --shard), each with its
+          own Postgres. With more than 1, `--shard=i/n` is appended to
+          integration-command.
+        type: number
+        default: 1
       postgres-image:
         type: string
         default: postgres:16-alpine
@@ -102,14 +109,20 @@ jobs:
       statuses: write
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
+      integration-shards: ${{ steps.plan.outputs.integration-shards }}
     steps:
       - id: plan
         env:
           SHARDS: ${{ inputs.shards }}
+          INTEGRATION_SHARDS: ${{ inputs.integration-shards }}
         run: |
-          n=$SHARDS
-          case "$n" in ''|*[!0-9]*|0) n=1 ;; esac
-          echo "shards=$(seq -s, 1 "$n" | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+          list() {
+            n=$1
+            case "$n" in ''|*[!0-9]*|0) n=1 ;; esac
+            seq -s, 1 "$n" | sed 's/^/[/;s/$/]/'
+          }
+          echo "shards=$(list "$SHARDS")" >> "$GITHUB_OUTPUT"
+          echo "integration-shards=$(list "$INTEGRATION_SHARDS")" >> "$GITHUB_OUTPUT"
       - name: Post pending
         env:
           GH_TOKEN: ${{ github.token }}
@@ -234,6 +247,12 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    # Each part is its own job, so each has its own Postgres. A failed part
+    # does not cancel the others: every failure is reported at once.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.start.outputs.integration-shards) }}
     services:
       postgres:
         image: ${{ inputs.postgres-image }}
@@ -260,7 +279,14 @@ jobs:
           INTEGRATION_COMMAND: ${{ inputs.integration-command }}
           URL_VAR: ${{ inputs.integration-database-url-var }}
           DB_URL: postgres://postgres:postgres@127.0.0.1:${{ inputs.postgres-port }}/postgres
-        run: env "$URL_VAR=$DB_URL" $INTEGRATION_COMMAND
+          SHARDS: ${{ inputs.integration-shards }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          if [ "$SHARDS" -gt 1 ]; then
+            env "$URL_VAR=$DB_URL" $INTEGRATION_COMMAND --shard="$SHARD/$SHARDS"
+          else
+            env "$URL_VAR=$DB_URL" $INTEGRATION_COMMAND
+          fi
 
   # Runs no pull-request code. A needed job that did not succeed, was skipped
   # without being switched off, or was cancelled is a failure.
